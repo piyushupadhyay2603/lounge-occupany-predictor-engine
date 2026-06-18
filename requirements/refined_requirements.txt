@@ -1,5 +1,5 @@
 ================================================================================
-REFINED REQUIREMENTS — Priority Pass Lounge Occupancy Prediction Engine
+REFINED REQUIREMENTS —   Lounge Occupancy Prediction Engine
 ================================================================================
 
 Base : requirements/original_requirements.txt
@@ -8,7 +8,7 @@ Base : requirements/original_requirements.txt
 1. OBJECTIVE
 --------------------------------------------------------------------------------
 
-Build a lounge occupancy prediction engine that helps Priority Pass users make
+Build a lounge occupancy prediction engine that helps   users make
 better decisions about which lounge to use and which flight to book, by
 predicting how full a lounge will be at a given time.
 

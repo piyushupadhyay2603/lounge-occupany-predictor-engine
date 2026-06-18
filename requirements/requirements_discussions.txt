@@ -1,4 +1,4 @@
-### DISCUSSIONS — Priority Pass Lounge Occupancy (working notes)
+### DISCUSSIONS — Lounge Occupancy (working notes)
 
 ## CONCRETE DECISIONS (agreed)
 
