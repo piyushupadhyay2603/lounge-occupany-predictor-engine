@@ -11,4 +11,4 @@ Attempted problem : A tool to predict airport lounge occupancy, helping our user
 | [`UI_previews/`](UI_previews/) | Customer POV of what the prediction engine can solve for them - AI [claude] |
 
 
-Note : All other files are phases of iterations that ultimately lead to the [`Deliverables/Final_architecture.pdf`](Deliverables/Final_architecture.svg) and can be ignored.
+Note : All other files are phases of iterations that ultimately lead to the [`Deliverables/Final_architecture.svg`](Deliverables/Final_architecture.svg) and can be ignored.
