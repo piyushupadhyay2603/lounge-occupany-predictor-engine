@@ -1,0 +1,144 @@
+### WAY FORWARD - FUTURE THINKING / OPEN POINTERS
+
+ABOUT THIS FILE:
+  This file collects pointers for FUTURE thinking on the architecture - ideas,
+  refinements, and decisions worth revisiting as the system matures. These are
+  NOT part of the architecture deliverables of the current exercise; they are
+  parked here so they are not lost. Treat each as a prompt for a later, deeper
+  discussion when/if it becomes relevant.
+
+--------------------------------------------------------------------------------
+POINTER 1: Training-data window as historical data grows (data retention vs
+           training relevance)
+--------------------------------------------------------------------------------
+
+PROBLEM:
+  Historical data grows unbounded (append-only). After, say, 10 years of running,
+  should the demand forecaster still train on 10-year-old data? Old data describes
+  a world that has changed (new terminals/lounges, route/carrier changes, shifting
+  travel behaviour), so training on everything biases the model toward stale
+  patterns - and is slower/costlier for no gain.
+
+SOLUTION (in brief):
+  - Train on a TRAILING WINDOW (e.g. ~12-24 months), NOT the full archive.
+      * Long enough to capture full seasonality (year+ of cycles, holidays,
+        day-of-week).
+      * Short enough to stay current and "forget" stale behaviour.
+  - Optional refinement: RECENCY WEIGHTING (weight recent data more, old data
+    less) - a smooth alternative to a hard cutoff.
+  - The historical store still RETAINS all data (cheap, append-only) for lineage/
+    audit; older-than-window data can be archived to cheaper storage. It just
+    falls OUT OF THE TRAINING QUERY.
+  - The forecaster owns its aggregation (Component 2 decision), so the window
+    selection lives in the forecaster - the store does not change.
+  - The offset-distribution histogram is recomputed over the same trailing window,
+    so it tracks drift automatically.
+  - Exact window length / weighting = implementation detail (like b, bucket size,
+    cadence).
+
+--------------------------------------------------------------------------------
+POINTER 2: Model "anomalies" as explicit training signal (not noise)
+--------------------------------------------------------------------------------
+
+TERMINOLOGY:
+  "Anomalies" = umbrella term for KNOWN events that systematically shift lounge
+  demand away from the normal pattern, e.g. public holidays, festive/peak seasons,
+  planned flight cancellations, strikes/irregular ops, major events, weather
+  disruptions.
+
+PROBLEM:
+  Today the forecaster treats an anomalous day as just another sample - its effect
+  is absorbed as NOISE (slightly widens the p10-p90 band, barely moves p50). That
+  is robust, but it means the model neither PREDICTS these swings nor EXPLAINS
+  them - on a known holiday it will still forecast a normal day.
+
+SOLUTION (in brief) - make anomalies an EXPLICIT input rather than noise:
+  - Add anomaly indicators as COVARIATES/features to the forecaster (e.g.
+    is_public_holiday, is_peak_season, planned_cancellation flag, event/disruption
+    flags). The model then learns the demand shift conditional on the anomaly and
+    forecasts it, instead of averaging it away.
+  - These features must be available at INFERENCE for the future window too (e.g.
+    a holiday calendar, a known planned-cancellation feed, scheduled events) - not
+    just in history.
+  - Alternative/companion: detect + down-weight or exclude unexplained anomaly
+    days (one-off irregularities) so they do not pollute the "normal" pattern,
+    while KEEPING explainable, repeating anomalies (holidays) as features.
+  - Net effect: better accuracy on the days that matter most (the busy/abnormal
+    ones), and the band reflects genuine residual uncertainty rather than
+    swallowing predictable structure.
+
+  Scope note: requires an anomaly/calendar/events data source and feature
+  engineering; deferred as future work, not part of the current deliverable.
+
+--------------------------------------------------------------------------------
+POINTER 3: When to make the ARRIVAL SPREAD ML-based (currently a measured
+           histogram, no ML)
+--------------------------------------------------------------------------------
+
+CURRENT STATE:
+  Arrival spread = an empirical, measured offset histogram per lounge (no ML),
+  re-measured each cycle (persistence). This works because the spread is STABLE
+  and LOW-DIMENSIONAL with enough data per segment.
+
+SCENARIOS THAT WOULD JUSTIFY MOVING TO AN ML MODEL:
+  1. HIGH-DIMENSIONAL CONDITIONING (sparsity): if the offset shape varies by many
+     interacting factors at once (time-of-day x haul x destination x carrier x
+     season), per-combination histograms run out of data per cell. ML generalizes
+     across sparse combinations. (Most likely trigger.)
+  2. DYNAMIC / CONTINUOUS SIGNALS: if spread depends on live/continuous inputs
+     (security queue length, terminal congestion, weather), a model can learn the
+     functional relationship and condition on real-time features; a histogram cannot.
+  3. COLD-START / LOW-DATA LOUNGES: a new lounge/airport has little history; an ML
+     model trained across all lounges can borrow strength (transfer) from lounge
+     attributes; a per-lounge histogram cannot.
+  4. PREDICTABLE (not just reactive) DRIFT: known upcoming changes (new terminal
+     layout, relocated security, schedule overhaul) - a feature-based model can
+     anticipate the shift; the histogram only catches up after data accumulates.
+  5. NONLINEAR INTERACTIONS: complex interactions (e.g. busy days -> arrive earlier,
+     but only on some routes) explode hand-defined segments; ML captures them.
+  6. COUPLING WITH DEMAND/OTHER OUTPUTS: if "how many" and "how early" become
+     correlated, a joint/conditional model beats independent histograms.
+
+MIGRATION PATH (don't jump to ML early):
+  histogram -> segmented histograms (still no ML) -> ML conditional model
+  (e.g. quantile regression on offset, or a small conditional-density model)
+  ONLY once segmentation visibly fails (sparse/dynamic/nonlinear).
+
+RULE OF THUMB: keep the measured histogram while spread is stable + low-dimensional
+  + has enough data per segment; switch to ML when it becomes high-dimensional/
+  sparse, dynamic, needs cross-lounge generalization, or nonlinear.
+
+--------------------------------------------------------------------------------
+POINTER 4: Monitoring demand drift (predicted demand vs actual lounge entries)
+--------------------------------------------------------------------------------
+
+WHAT:
+  An OBSERVABILITY capability (NOT a training input - see retraining note): log the
+  demand the forecaster SERVED and later compare it against the ACTUAL realized
+  lounge entries for the same lounge/time, to measure forecast quality and detect
+  DRIFT (model going stale as behaviour changes).
+
+WHY IT IS SEPARATE FROM RETRAINING:
+  Retraining derives its error internally from (features -> actual) and does NOT
+  need stored predictions. Monitoring is the opposite need: it requires the
+  PREVIOUSLY-SERVED predictions persisted, so we can compute predicted-vs-realized.
+
+WHAT TO MEASURE:
+  - Point error: predicted demand (p50) vs actual entries (e.g. MAE / MAPE) per
+    lounge / time-bucket / horizon.
+  - Quantile calibration: are realized values below p90 ~90% of the time, below
+    p10 ~10% of the time? (is the uncertainty band honest?)
+  - Drift over time: error trending up -> model stale -> trigger retrain / alarm.
+  - Slice the error by horizon (near-term vs far-future), lounge, day-type to spot
+    where the model is weak.
+
+HOW (sketch, impl detail):
+  - Persist served forecasts (a prediction log) keyed by lounge + bucket + run/
+    model_run_id (ties to NFR8 lineage).
+  - A scheduled job joins prediction log vs realized arrivals (from history) and
+    emits metrics to a dashboard / alerting (e.g. CloudWatch / Grafana).
+  - Drift thresholds can trigger retraining or notify ops (NFR4 "monitored over
+    time" made concrete).
+
+SCOPE: observability enhancement; measurability already noted in NFR4. Not part of
+  the current deliverable.

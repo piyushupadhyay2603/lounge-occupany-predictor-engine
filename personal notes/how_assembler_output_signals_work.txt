@@ -1,0 +1,80 @@
+lets tackle the assembler's output next, according to your understanding and our discussion, show me what assembler outputs
+
+Based on AD18 and everything we've worked out, the assembler outputs one materialized occupancy curve per lounge — a sequence of time-bucketed records. Here's the concrete shape.
+
+Curve header (per lounge, per assembler run)
+lounge_id     : LHR-T5-A
+capacity      : 100
+bucket_size   : 15 min
+generated_at  : 2026-06-20 08:32
+Per-bucket records (the curve itself)
+┌────────────┬───────────┬───────────┬───────────┬───────────┬──────────────┬────────────┬──────────┐
+│ bucket     │ occupancy │ occupancy │ occupancy │ occupancy │ seat_        │ confidence │ source   │
+│ (start)    │   p10     │   p50     │   p90     │   pct(p50)│ probability  │            │          │
+├────────────┼───────────┼───────────┼───────────┼───────────┼──────────────┼────────────┼──────────┤
+│ 08:30      │   72      │   78      │   85      │   78%     │   0.99       │ high       │ live     │
+│ 08:45      │   80      │   86      │   93      │   86%     │   0.92       │ high       │ live     │
+│ 09:00      │   85      │   92      │  101      │   92%     │   0.73       │ medium     │ blend    │
+│ 09:15      │   83      │   90      │  100      │   90%     │   0.78       │ medium     │ blend    │
+│ 10:00      │   60      │   74      │   90      │   74%     │   0.85       │ low        │ baseline │
+└────────────┴───────────┴───────────┴───────────┴───────────┴──────────────┴────────────┴──────────┘
+Field-by-field
+Field	What it is	How derived
+bucket_start	the time slice key	bucketing
+occupancy_p10/p50/p90	the occupancy distribution (headcount) for that bucket	arrivals − departures (convolution), propagated through the arrival quantiles + delay/no-show variance
+occupancy_pct	occupancy_p50 / capacity	derived
+seat_probability	P(occupancy < capacity) — chance a seat is free	percentile of capacity on the occupancy distribution (AD22)
+confidence	trust signal	driven by source + band width (AD22: shrinks toward now)
+source	live / blend / baseline	which feed produced the bucket (near→far)
+Key points (consistent with our decisions)
+Occupancy is a distribution per bucket (p10/p50/p90), not a point — that's what makes seat_probability meaningful (AD8, AD22).
+seat_probability = P(occupancy < capacity) — strict capacity, not a comfort threshold (comfort is app-layer, AD18).
+source shifts live → blend → baseline as buckets go from near-term (live-dominated) to far-future (forecaster-only), and confidence tracks it.
+No flight-wise data, whole-lounge only (AD7).
+This is the curve-store schema — the assembler's output goes straight to the store; nothing transforms it before the Scoring API except a lookup (AD11).
+Two small things to confirm before locking
+occupancy_pct — do we carry just p50%, or also p10%/p90% (a % band)? I showed p50% only; the band is recoverable from the headcount quantiles ÷ capacity. My lean: store the headcount quantiles + capacity, and treat pct as a derived convenience (p50%). Agree?
+confidence representation — enum (high/medium/low) vs a numeric score? I showed an enum tied to source. Agree, or do you want a numeric confidence?
+Does this output match your understanding? Confirm those two and I'll lock the assembler's Outputs into the low-level doc.
+
+occupancy_pct - also p10%/p90%. lets output the more data points as we can, what is to be used can be the logic of scoring API
+
+high/medium/low confidence works, but i want to know what this confidence value represents and how it can be utilized downstream
+
+Good — let me lock the pct decision and then unpack confidence properly, because it's a distinct concept from seat_probability and people often conflate them.
+
+occupancy_pct → carry p10/p90 too
+Agreed: output occupancy_pct_p10 / p50 / p90 (headcount quantiles ÷ capacity). We emit the fuller set; the Scoring API owns the logic of which to use (e.g. average p50 over a window for a typical estimate, or use p90 for a conservative "worst-case" answer). Locking the assembler as the producer of all data points, the API as the selector.
+
+What confidence represents
+confidence answers a different question than seat_probability:
+
+seat_probability = "how likely is a seat free?" — a property of the world.
+confidence = "how much should you trust that number?" — a property of the estimate itself (meta-level).
+They're independent. Examples:
+
+seat_probability = 0.85, confidence = high → "we're sure it's ~85%."
+seat_probability = 0.85, confidence = low → "best guess 85%, but shaky."
+So confidence is how much real information backs this bucket, driven by:
+
+source / horizon — live (mostly observed facts) = high; blend (live + forecast) = medium; baseline (pure forecast, far-future) = low. (This is AD22: variance shrinks toward now.)
+Band width — narrow p10–p90 = high; wide = low.
+Degraded mode (NFR3) — if the live feed drops and a near-term bucket falls back to baseline, confidence drops to flag the degradation.
+How it's utilized downstream (Scoring API / app layer)
+Message framing — high → show a crisp number ("seat very likely"); low → hedge ("based on typical patterns, may vary").
+Whether to surface at all — the app may suppress or heavily caveat a low-confidence prediction rather than mislead.
+Graceful degradation signal (NFR3) — a sudden drop to low confidence on near-term buckets tells the app the live feed is down, so it can warn the user / fall back gracefully.
+Ranking input (UJ1) — when scoring candidate flights, the app can prefer or annotate options whose occupancy estimate is high-confidence, rather than betting on a shaky far-future guess.
+Monitoring/ops — persistently low confidence where it shouldn't be flags model/data issues (NFR4).
+Crucially, the assembler emits confidence; how to act on it is the app layer's call (FR12) — same predict-and-score boundary we've kept throughout.
+
+So the locked output per bucket
+bucket_start
+occupancy_p10 / p50 / p90              (headcount)
+occupancy_pct_p10 / p50 / p90         (÷ capacity)
+seat_probability   (= P(occupancy < capacity))
+confidence         (high / medium / low)
+source             (live / blend / baseline)
+plus header: lounge_id, capacity, bucket_size, generated_at.
+
+Good to write this into the low-level doc as the assembler's Outputs (with the confidence semantics + downstream uses noted)?

@@ -1,0 +1,295 @@
+### ARCHITECTURE DISCUSSIONS — Tech choices & core prediction module
+(Base: requirements/refined_requirements.txt)
+
+## CONCRETE DECISIONS
+
+AD1. The occupancy engine is NOT a single model predicting occupancy directly.
+     occupancy(t) = arrivals-by-t  MINUS  departures-by-t.
+     It is assembled from an arrival component + a departure component.
+     NOTE (low-level refinement): occupancy is NOT clipped at capacity in the
+     output - it may exceed 100% as an OVERFLOW signal; the capacity cap is
+     encoded in seat_probability = P(occupancy < capacity), not by clipping.
+
+AD2. DEMAND FORECASTER = the ML, data-driven piece (we have history for it).
+     - Probabilistic (quantile) forecast, PER LOUNGE (NOT per flight - this was
+       refined at low level; flight identity is "baked into" the curve).
+     - OUTPUT (not occupancy!): two signals, both per lounge:
+         (a) ARRIVALS CURVE = inflow per time-bucket, as quantiles (p10/p50/p90),
+         (b) ARRIVAL-SPREAD / OFFSET DISTRIBUTION = normalized distribution of how
+             long before departure people arrive. (a) is predicted (ML); (b) is a
+             MEASURED histogram (no ML) - see low-level Component 3.
+       => It does NOT output occupancy, %, or seat-probability. Those are
+          assembled downstream (see AD1, AD5, AD18).
+     - INPUTS at inference: FUTURE flight schedule (which flights + scheduled d,
+       attributes) + calendar (day-of-week, seasonality, holidays).
+     - INPUTS at training: historical lounge arrivals flight-wise (count +
+       arrival timestamps) + historical flight departure times + delays.
+     - Does NOT consume: capacity c, buffer b (those are assembler-only), or any
+       live stream at inference. Live data reaches it ONLY via retraining (AD20).
+     - Tooling (resolved, AD-O3): arrivals curve = SageMaker built-in XGBoost
+       quantile regression (AutoGluon/JumpStart as lower-code alt); arrival spread
+       = measured histogram (no ML). DeepAR & Autopilot rejected. NOT AWS Forecast,
+       NOT hand-rolled.
+
+AD3. DEPARTURE logic = NOT an ML model, and NOT a separate component. It is the
+     single rule  leave = d_est - b  applied INSIDE the Occupancy Assembler
+     (there is no standalone "departure model" box).
+     - b = departure buffer. A single FIXED GLOBAL master-config scalar (AD-O1).
+     - Rationale ML is NOT justified: leaves are NEVER observed (NOTE2), so there
+       is no ground-truth dwell data to train on. b is assumed KNOWN (AD-O2).
+     - Live reactivity (delays, FR5) is handled by re-anchoring to live d_est:
+       leave recomputes automatically. No retrain, no dynamic dwell model.
+
+AD4. PROBABILITY / uncertainty does NOT come from the departure buffer. Its
+     sources, in order of importance:
+       1. Arrival timing  (how many enter & when) -> demand forecast is already
+          probabilistic (quantiles). PRIMARY source.
+       2. Delays -> d shifts via live flight status. Stochastic.
+       3. Buffer spread (sigma) -> departure-side variance. OPTIONAL, second-order;
+          add later only if departure timing proves a material independent error.
+     => A fixed scalar b still yields a meaningful seat-probability, because (1)
+        and (2) alone make occupancy a distribution.
+
+AD5. OCCUPANCY ASSEMBLER = plain compute, no ML. The ONE component that ever
+     produces a final occupancy curve (occupancy is ALWAYS assembled, never
+     directly forecast). It is the integration point that consumes:
+       - demand forecaster output (per-lounge arrivals curve + offset distribution),
+       - master config (capacity c, buffer b, [no spread - that's forecaster]),
+       - live data (scans, reservations, live delays) when present.
+     It derives DEPARTURES by CONVOLVING the arrivals curve with the dwell survival
+     function (dwell = offset - b), i.e. occupancy = arrivals (X) S; then derives
+     %, seat-prob, quantiles. Occupancy is NOT capped (overflow allowed; cap lives
+     in seat_probability). NO per-flight summation - works on the per-lounge curve.
+     ONE assembler, TWO feeds (AD19) - not two assemblers, not a "speed layer"
+     separate from a "batch layer". Honors single-curve (FR1).
+
+## REVISED MODULE SHAPE (one line)
+   One ML demand forecaster (per-lounge arrivals curve + measured offset spread)
+   + one fixed config buffer b + one deterministic Occupancy Assembler. NOT two
+   ML models, NOT a separate departure model, NOT two assemblers.
+
+## DATA SOURCES / INPUTS (agreed)
+
+A. STATIC / MASTER-CONFIG (rarely changes, fetched on demand)
+   - Lounge capacity: total seats per lounge (A1). Used by assembler to turn
+     headcount -> % full / seat-probability.
+   - Departure buffer b: fixed offset, leave = d - b (AD3). Master config.
+
+B. HISTORICAL DATA STORE (forecaster training inputs, refreshed via AD20 loop)
+   - Historical lounge arrivals FLIGHT-WISE: count + arrival timestamps per
+     flight (A7). "Flight-wise" implies count + timing (timing trains the spread).
+     Trains the demand forecaster.
+   - Historical flight departure times + delays: past delay distributions
+     (FR5b, FR6). Delay covariate; basis for E[d'].
+   - [REMOVED] Floor-manager input — explicitly dropped from the architecture.
+
+C. LIVE DATA (feeds the Occupancy Assembler; NOT the forecaster)
+   - Real-time lounge arrivals: (entry_time, d) per scan (A2, A3). Observed.
+   - Lounge pre-booking reservations: (d, reserved slot) (A4). Committed/forward.
+   - Near-time flight data (LIVE DELAYS): d_est / delay movement (A5). Corrective.
+   NOTE: NOT a true streaming system - consumed by a MICRO-BATCH assembler
+   (AD21). No Kafka/Kinesis required.
+
+D. REFERENCE / PER-REQUEST LOOKUPS
+   - Flight schedule (reference, NOT live): future flights + scheduled d (A5).
+     Feeds the FORECASTER ONLY (future, inference). The assembler does NOT take a
+     schedule edge - it obtains each flight's d / d_est from live data (scans,
+     reservations, live delays). Supplies candidate [d] for UJ1 via the app layer.
+   - User flight time d only (from A6): anchors the query (A10).
+
+DS-OBS1. Departures are the ONLY quantity never fed in as data; the engine must
+         manufacture them via leave = d_est - b (NOTE2, AD16).
+DS-OBS2. Live inputs split by time direction: backward (real-time arrivals =
+         who is already in) + forward (pre-bookings = who is committed) +
+         corrective (live delays = d_est movement). This is what lets the
+         assembler compute occupancy = already-in + committed-to-come
+         - projected-to-leave. (Consumed by a micro-batch assembler, not a
+         streaming system - AD21.)
+
+## USER PREFERENCES (agreed)
+AD6. User PREFERENCES (favourite lounge, amenities, etc.) have NO role in the
+     prediction engine. Occupancy is a property of the lounge, not the user.
+     Preferences bear ONLY on the presentation/recommendation layer (app-side),
+     alongside eligibility and ranking (all out of scope per A9/FR12).
+     From service A6 the engine consumes ONLY the user's flight time d.
+     DIAGRAM ADDITION: an "Application DB" feeds the Application backend with
+     "user preferences" (an arrow Application DB -> Application backend, labelled
+     user preferences). This reflects original_requirements service (ii) "my
+     preferences and flight time". It lives entirely on the APP side (downstream
+     of the Scoring API / engine boundary). HOW preferences are used (within the
+     app backend or in interpreting Scoring API data) is OUT OF SCOPE of this
+     prediction engine - no further detail required.
+
+## GRANULARITY (agreed)
+AD7. Prediction unit = the WHOLE LOUNGE. No sub-lounge / zone-level granularity.
+
+## RESOLVED (formerly open)
+AD-O1. RESOLVED. One GLOBAL b is good enough. No segmentation (no per-lounge /
+       time-of-day / domestic-vs-international table).
+AD-O2. RESOLVED. The unverifiable-b risk is ACCEPTED. Deriving/predicting b is a
+       SEPARATE process outside this project's scope; for this project assume b
+       is KNOWN (a given config value).
+
+## DEPARTURE-TIME MODEL (agreed — supersedes the loose "leave = d - b")
+
+AD16. Per-passenger lounge departure is computed, not measured. Notation:
+        t      = arrival time (from scan, A3)            [known]
+        d      = scheduled / expected departure time     [known, from flight feed]
+        d_est  = estimated (current) departure time      [from flight feed]
+        d'     = delay = d_est - d                        [see paths below]
+        b      = fixed global departure buffer            [known config, AD-O1/2]
+      Lounge departure (seat frees up):
+        leave  = d_est - b = (d + d') - b
+      Occupancy at time tau = count of passengers with  t <= tau < leave,
+      divided by lounge capacity for the % / seat-probability.
+      Dwell (= leave - t = d + d' - b - t) is DERIVABLE but is NOT the served
+      quantity; the engine works in terms of `leave`, not dwell.
+
+AD17. d' source differs by path (same formula):
+        - Live (Path B): d' is OBSERVED directly from flight status
+          (d_est - d). Not ~0; it is the measured delay.
+        - Batch (Path A): no live status exists; d' = EXPECTED delay E[d']
+          drawn from the historical delay distribution.
+      d' remains a stochastic uncertainty source (AD4 #2).
+
+## CONFIRMED COMPONENTS & FLOW (matches draft_high_level_architecture.drawio)
+
+   Historical data store --(arrivals flight-wise; departure times+delays)--> Demand forecaster
+   Flight schedule (reference) ------------------------------------------> Demand forecaster
+   Demand forecaster --(per-lounge arrivals curve; arrival-spread/offset distribution)-> Occupancy assembler
+   Master config (capacity c, buffer b) --------------------------------> Occupancy assembler
+   Live data (real-time arrivals; reservations; live delays) -----------> Occupancy assembler
+   Occupancy assembler --> Occupancy Prediction Curve (Curve Store) --> Scoring API
+   Scoring API <-> Application backend <-> Mobile App / Web   (app backend OUT OF SCOPE)
+   Retraining loop (sources = LIVE DATA only; assembler is NOT a source):
+     Live data --(departed flight schedules; realized lounge arrivals per flight, raw)--> Retraining loop data store --(batch sync every N)--> Historical data store
+
+## SERVING & DATA FLOW — agreed
+
+AD8. Curve representation. Per lounge, a TIME-BUCKETED occupancy curve
+     (15-min buckets, locked at low level). Each bucket holds an occupancy
+     DISTRIBUTION (quantiles p10/p50/p90), from which occupied/capacity and
+     seat-probability are derived. Header carries model_run_id (lineage, NFR8).
+     Both layers read/write this same structure -> keeps it "one curve" (FR1).
+
+AD9. Far-future buckets (no live data): the Assembler runs on forecaster output
+     ONLY -> baseline curve. source = "baseline". Computed periodically.
+
+AD10. Near-term buckets (live data exists): the Assembler PATCHES them using live
+      data + the forecaster RESIDUAL (AD19). source = "live"/"blend". The "live
+      horizon" is not a hard boundary - it is where known occupants + reservations
+      stop carrying information; beyond it the curve naturally = baseline.
+
+AD11. Served curve = ONE MATERIALIZED curve per lounge = baseline with near-term
+      buckets overwritten. NOT merged at read time => read = lookup (NFR2).
+      Diagram: "Occupancy Prediction Curve (Curve Store)" is ONE merged box (the
+      artifact and its store are the same thing).
+
+AD12. Ingestion: Live Data -> Occupancy Assembler (which includes the
+      reconciliation/dedupe step, A8) -> Curve Store -> Scoring API ->
+      Application backend -> Mobile/Web. The Scoring API is the engine boundary;
+      app backend (eligibility, ranking, UI) is OUT OF SCOPE (FR12).
+
+AD13. Reconciliation/dedupe (A8) is a step INSIDE the Occupancy Assembler, not a
+      separate upstream service.
+
+AD14. Live flight delays are a DUAL SINK: (a) into the assembler to re-anchor
+      leave = d_est - b, and (b) into the retraining loop (AD20, FR5b).
+
+AD15. RESOLVED (low-level). Curve store = DynamoDB (partition key = lounge_id,
+      sort key = bucket_start); Redis as a future read-cache. See low-level
+      Component 5.
+
+## FORECASTER vs ASSEMBLER OUTPUTS (agreed)
+
+AD18. The two components emit DIFFERENT schemas:
+      - Demand forecaster output (per LOUNGE): (a) arrivals curve = per time-bucket
+        inflow quantiles (p10/p50/p90); (b) arrival-spread / offset distribution
+        (normalized). Intermediate - NOT served, NOT an occupancy curve.
+      - Occupancy Assembler output (per LOUNGE per TIME-BUCKET) = the served
+        curve. Per bucket: bucket_start, occupancy_p10/p50/p90,
+        occupancy_pct_p10/p50/p90 (= occ quantiles / capacity, UNCAPPED),
+        seat_probability (= P(occupancy < capacity), strict capacity not comfort;
+        comfort threshold is app-layer), confidence (high/med/low),
+        source (live/blend/baseline).
+        Header: lounge_id, capacity, bucket_size, generated_at, model_run_id.
+      The BASELINE curve and the NEAR-TERM curve share this SAME schema.
+
+## ONE ASSEMBLER, TWO FEEDS + RESIDUAL BLEND (agreed - core insight)
+
+AD19. There is ONE Occupancy Assembler, consuming the forecaster output in BOTH
+      paths (the forecaster never has its own assembler). It blends, per bucket
+      (low-level Component 4):
+        near-term occupancy =
+            still_present (live: scanned occupants whose leave > tau, projected)
+          + future-inflow-still-present, where FUTURE INFLOW per bucket =
+            MAX(forecast arrivals, reservations)  [NOT additive - avoids
+            double-counting, since the forecaster curve already includes
+            reservation-holders]
+          (departures via convolution with dwell survival, dwell = offset - b;
+           occupancy UNCAPPED, cap encoded in seat_probability)
+      Far-future: no live data -> pure forecaster baseline (arrivals (X) S).
+      Near-term: still_present dominates + max(forecast,reservations) inflow ->
+      mostly live. Graceful handoff as the live horizon ends.
+
+AD20. CONTINUOUS RETRAINING LOOP (FR8). The "retraining loop data store" reads
+      ONLY from LIVE DATA - the Occupancy Assembler is NOT a source (the old
+      "assembler emits deduped arrivals" idea is DROPPED). It reads two things:
+        - Departed flight schedules (scheduled + actual departure + delay;
+          assume actual departure is always populated).
+        - Realized lounge arrivals per flight (raw scans; dedupe IGNORED here -
+          a scan is one physical entry, so counting scans = realized arrivals;
+          no reservation-vs-scan dedup needed for history).
+      It buffers live data until a flight's actual departure populates (which also
+      guarantees all that flight's lounge entries are in), then a batch job syncs
+      completed rows to the Historical data store and deletes them from the buffer.
+      Loop trains ONLY the forecaster; b is never trained (assumed known, AD-O2);
+      leaves are never logged (never observed).
+      Low-level detail: see low_level_architecture_discussions.txt.
+
+## SERVING SIMPLIFICATION (agreed)
+
+AD21. No true real-time / streaming layer. Nobody queries t=now to the second;
+      queries anchor to a future d. The near-term curve is produced by a
+      MICRO-BATCH run of the Assembler (every few minutes) over latest live data
+      - NOT a per-event streaming system. Relaxes NFR1 (drop "seconds"). Frequent
+      RETRAINING is NOT a substitute - retraining updates learned averages, it
+      does not inject today's realized actuals; only the assembler does that.
+
+## OCCUPANCY IS ALWAYS A DISTRIBUTION (agreed)
+
+AD22. Every bucket is a distribution, so seat_probability is well-defined. It
+      COLLAPSES to a deterministic point at t=now (observed; seat_prob in {0,1}).
+      Future near-term variance comes from: delay drift (d_est can still move) +
+      reservation no-show + uncommitted-walk-in residual. Variance shrinks as the
+      query time approaches now (= the confidence/source signal).
+
+## OCCUPANCY ASSEMBLER INPUTS (agreed - locked)
+
+AD23. The Occupancy Assembler takes inputs from exactly THREE sources, and NOT
+      from the flight schedule:
+        1. LIVE DATA FEED:
+           - real-time lounge arrivals (scans): entry_timestamp, flight's d,
+             lounge id  (who is already in),
+           - lounge pre-booking reservations: d, reserved slot, lounge id
+             (committed future arrivals),
+           - near-time flight data (live delays): d_est / delay per flight
+             (to re-anchor leave = d_est - b).
+        2. DEMAND FORECASTER:
+           - arrivals curve per lounge (quantiles per time-bucket),
+           - arrival-spread / offset distribution per lounge.
+        3. MASTER CONFIG:
+           - lounge capacity c (per lounge),
+           - buffer b.
+      NO FLIGHT SCHEDULE input. The schedule reaches the assembler indirectly:
+      (a) baked into the forecaster's arrivals curve (far-future), and
+      (b) carried as d / d_est on each live record (near-term). Departures are
+      derived by convolving the arrivals curve with the dwell distribution
+      (dwell = offset - b) - no schedule needed. This closes the parked
+      schedule->assembler boundary: schedule -> FORECASTER only.
+
+## RESOLVED (formerly open)
+AD-O3. RESOLVED (low-level). Demand forecaster arrivals curve = SageMaker built-in
+       XGBoost quantile regression (AutoGluon/JumpStart as lower-code alt;
+       Autopilot & DeepAR rejected). Arrival spread = measured histogram (no ML).
+       See low_level_architecture_discussions.txt (Component 3).

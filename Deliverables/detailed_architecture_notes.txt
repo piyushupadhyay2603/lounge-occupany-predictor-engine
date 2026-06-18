@@ -1,0 +1,857 @@
+### LOW LEVEL ARCHITECTURE DISCUSSIONS
+(Base: requirements/refined_requirements.txt + high level architecture/high_level_architecture_discussions.txt)
+
+Format per functional component: Inputs · Outputs · Internal logic · Technology.
+Note: data points are described abstractly; concrete table/column structures are
+an implementation detail and intentionally not captured here.
+
+Here is the data format used by workflow: 
+live data --> retraining loop data store (component 1) --> historical data store (component 2) --> output
+
+Table: Flight data
+================================================================================
+flight_number | scheduled_departure | actual_departure  | delay_min | iata | terminal | lounge_name      | lounge_id  | created_at        | updated_at
+--------------+---------------------+-------------------+-----------+------+----------+------------------+------------+-------------------+-------------------
+BA117         | 2026-06-20 09:00    | 2026-06-20 09:25  | 25        | LHR  | T5       | Galleries First  | LHR-T5-A   | 2026-06-20 06:02  | 2026-06-20 09:25
+BA283         | 2026-06-20 09:15    | 2026-06-20 09:15  | 0         | LHR  | T5       | Galleries First  | LHR-T5-A   | 2026-06-20 06:40  | 2026-06-20 09:15
+AA109         | 2026-06-20 10:00    | 2026-06-20 10:40  | 40        | LHR  | T3       | Greenwich Lounge | LHR-T3-B   | 2026-06-20 07:10  | 2026-06-20 10:40
+
+
+Table: Lounge data
+================================================================================
+lounge_id  | entry_timestamp    | flight_number | travel_date  | created_at        | updated_at
+-----------+--------------------+---------------+--------------+-------------------+-------------------
+LHR-T5-A   | 2026-06-20 07:05   | BA117         | 2026-06-20   | 2026-06-20 07:05  | 2026-06-20 07:05
+LHR-T5-A   | 2026-06-20 07:32   | BA117         | 2026-06-20   | 2026-06-20 07:32  | 2026-06-20 07:32
+LHR-T5-A   | 2026-06-20 07:48   | BA283         | 2026-06-20   | 2026-06-20 07:48  | 2026-06-20 07:48
+LHR-T5-A   | 2026-06-20 08:10   | BA117         | 2026-06-20   | 2026-06-20 08:10  | 2026-06-20 08:10
+LHR-T5-A   | 2026-06-20 08:25   | BA283         | 2026-06-20   | 2026-06-20 08:25  | 2026-06-20 08:25
+LHR-T3-B   | 2026-06-20 08:30   | AA109         | 2026-06-20   | 2026-06-20 08:30  | 2026-06-20 08:30
+
+================================================================================
+COMPONENT 1: RETRAINING LOOP DATA STORE
+================================================================================
+
+Purpose: stage live data for in-progress flights - both departed flight schedules
+AND on-floor lounge arrivals per flight (with entry timestamps) - and, once a
+flight has departed, sync those completed records into the Historical data store.
+Exists so the Historical data store only ever holds COMPLETED (departed) flights.
+
+INPUTS (read from LIVE DATA only; the Occupancy Assembler is NOT a source):
+  1. Departed flight schedule data, per flight-instance:
+     - flight number, scheduled departure time, actual departure time, delay,
+       IATA code, terminal, lounge identifier, travel date.
+     - Assumption: actual departure time is ALWAYS eventually populated
+       (cancellations / missing-feed edge cases are out of scope).
+  2. On-floor realized lounge arrivals per flight, WITH entry timestamps
+     (raw entry scans):
+     - lounge identifier, entry timestamp (per arrival), flight number,
+       travel date.
+     - Timestamps are retained per arrival (not just counts) so the forecaster
+       can later derive arrival offsets-before-departure (the spread label).
+     - Dedupe is IGNORED at this step: a scan is one physical entry, so counting
+       scans = realized arrivals. No reservation-vs-scan dedup needed for history.
+
+OUTPUTS:
+  - The same staged records written into the Historical data store, then deleted
+    from this store:
+      - departed flight schedule records, AND
+      - on-floor lounge arrivals per flight WITH their entry timestamps.
+    Both are synced on every batch job run for the flight-instances that have
+    completed (actual departure populated).
+
+INTERNAL LOGIC:
+  - Continuously buffer incoming live data (flight records + lounge entries) in
+    its own store, keyed by flight-instance.
+  - A flight-instance is "complete" when its actual departure time is populated.
+    This is the natural completion marker AND guarantees all that flight's lounge
+    entries have already occurred (passengers enter before the flight departs).
+  - A batch job runs every N interval: reads completed flight-instances together
+    with their on-floor lounge arrivals (with entry timestamps), writes BOTH to
+    the Historical data store, then DELETES the synced rows from this store.
+  - Net effect: this store holds only in-progress flights (small, bounded under
+    the always-departs assumption); the Historical store grows append-only with
+    completed flights only.
+
+TECHNOLOGY:
+  - SQL data store (staging buffer).
+  - Scheduled batch job (interval N) for sync-then-delete to Historical store.
+
+================================================================================
+COMPONENT 2: HISTORICAL DATA STORE
+================================================================================
+
+Purpose: the long-lived record of COMPLETED (departed) flights and their realized
+lounge arrivals; the training-data source for the Demand forecaster. Assumed
+pre-seeded with initial data.
+
+INPUTS (written by the Retraining loop data store's batch job):
+  1. Departed flight schedule records: flight number, scheduled departure time,
+     actual departure time, delay, IATA code, terminal, lounge identifier,
+     travel date.
+  2. Realized lounge entry records: lounge identifier, entry timestamp, flight
+     number, travel date.
+
+OUTPUTS (consumed by the Demand forecaster):
+  - RAW historical rows (NOT pre-aggregated). The forecaster owns its own
+    aggregation/feature logic so that logic can evolve without changing this
+    store (decision: forecaster aggregates, not the store).
+  - From these raw rows the forecaster derives:
+      Labels:
+        - realized arrival count per flight-instance (from lounge entries),
+        - arrival offsets-before-departure per flight-instance (entry timestamp
+          relative to departure time) -> trains the arrival spread.
+      Covariates:
+        - scheduled departure time (time-of-day),
+        - travel date (calendar: day-of-week, season, holiday),
+        - delay (delay covariate; basis for E[d']),
+        - lounge identifier (series key),
+        - IATA / terminal (grouping / context).
+  - Notable exclusions: NO capacity, NO buffer b (assembler-only); departures
+    (leaves) are never stored (never observed).
+
+INTERNAL LOGIC:
+  - Append-only store of completed flights + their realized lounge entries.
+  - No transformation / aggregation on its own; serves raw rows on read.
+  - Join key between flight records and lounge entries: flight number + travel
+    date (performed by the forecaster at read time).
+
+TECHNOLOGY:
+  - SQL data store (pre-seeded).
+
+--------------------------------------------------------------------------------
+END-TO-END (this slice): Live data -> Retraining loop data store (buffer until
+actual departure, batch sync every N) -> Historical data store (append-only,
+completed flights) -> raw rows -> Demand forecaster (aggregates its own
+labels + covariates).
+--------------------------------------------------------------------------------
+
+================================================================================
+COMPONENT 3: DEMAND FORECASTER
+================================================================================
+
+Purpose: predict, per lounge, the ARRIVAL (inflow) side of occupancy. It does NOT
+predict occupancy, %, or seat-probability (those are assembled downstream). It is
+the only ML component. It emits two arrival-side, observable-from-history signals
+that the Occupancy Assembler consumes.
+
+INPUTS:
+  Training (from Historical data store, raw rows - forecaster aggregates itself):
+    - historical departed flight schedule data (scheduled departure time, actual
+      departure time, delay, IATA, terminal, lounge id, travel date),
+    - historical on-floor lounge arrivals with entry timestamps (per lounge,
+      per flight, travel date).
+  Inference:
+    - future flight schedule (future flights + scheduled departure times +
+      attributes; reference data), and calendar features derived from it
+      (day-of-week, season, holiday).
+  Does NOT consume: lounge capacity, buffer b (assembler-only), or any live
+  stream at inference. Live data reaches it ONLY via the retraining loop (AD20).
+
+OUTPUTS (two signals, BOTH per lounge):
+  1. DEMAND / ARRIVALS CURVE - a probabilistic inflow curve over clock time:
+     per lounge, per time-bucket, expected arrivals as quantiles (e.g.
+     p10/p50/p90). Represents WHEN people enter the lounge (inflow, not
+     occupancy). The arrival-timing "spread" is implicit in this curve's shape.
+
+     lounge_id: LHR-T5-A
+bucket_size: 15 min
+date: 2026-06-20
+curve:
+  ┌────────────┬───────────┬───────────┬───────────┐
+  │ bucket     │ arrivals  │ arrivals  │ arrivals  │
+  │ (start)    │   p10     │   p50     │   p90     │
+  ├────────────┼───────────┼───────────┼───────────┤
+  │ 05:00      │    6      │    9      │   13      │
+  │ 05:15      │    8      │   12      │   17      │
+  │ 05:30      │   11      │   16      │   22      │
+  │ 05:45      │   14      │   20      │   27      │
+  │ 06:00      │   12      │   18      │   25      │
+  │ ...        │   ...     │   ...     │   ...     │
+  └────────────┴───────────┴───────────┴───────────┘
+Read as: "between 05:30 and 05:45, expect ~16 people to enter (p10 11, p90 22)." The whole day is a sequence of these. This is the curve shape driven by the downstream flight-departure spread + calendar.
+  
+  2. ARRIVAL-SPREAD / OFFSET DISTRIBUTION - per lounge, a normalized distribution
+     (sums to 1) of how long before departure lounge-goers arrive, bucketed by
+     offset (minutes before departure d). Represents HOW LONG people stay
+     relative to their flight. Needed by the assembler to derive departures
+     (dwell = offset - b) - it is NOT recoverable from the aggregate arrivals
+     curve, hence emitted explicitly.
+  Both are PER LOUNGE (granularity decision). No flight-wise output; flight
+  identity is "baked into" the curve via the schedule-driven shape.
+
+  lounge_id: LHR-T5-A
+offset_distribution (minutes before departure d):
+  ┌──────────────────┬──────────┐
+  │ offset bucket     │ fraction │
+  ├──────────────────┼──────────┤
+  │ 0–30 min          │   0.05   │
+  │ 30–60 min         │   0.15   │
+  │ 60–90 min         │   0.27   │
+  │ 90–120 min        │   0.28   │
+  │ 120–150 min       │   0.16   │
+  │ 150–180 min       │   0.09   │
+  └──────────────────┴──────────┘   (Σ = 1.00)
+Read as: "27% of a flight's lounge-goers arrive 60–90 min before departure." This is the shape the assembler convolves (after dwell = offset − b) to compute departures.
+
+INTERNAL LOGIC:
+  - Owns its own aggregation/feature logic over the raw historical rows (so it
+    can evolve without changing the Historical data store).
+  - Demand is ANCHORED to flight-departure spread: arrivals at time t are driven
+    by flights departing downstream of t (within the offset window). So the
+    arrivals model's features encode the downstream flight-departure spread
+    (e.g. flights/seats scheduled to depart in the relevant offset window after
+    t) + calendar; target = historical arrivals(t). Probabilistic (quantile).
+  - The offset distribution is learned from historical entry timestamps relative
+    to their flight's departure time.
+  - At inference: apply the learned relationship to the FUTURE flight schedule ->
+    future arrivals curve; emit the learned offset distribution.
+
+TECHNOLOGY (LOCKED - resolves AD-O3):
+  The forecaster is two sub-pieces with different needs (predict vs measure):
+
+  1. ARRIVALS CURVE = PREDICTED -> ML (must generalize to unseen future).
+     - SageMaker built-in XGBoost, QUANTILE regression (p10/p50/p90), tabular,
+       per (lounge, time-bucket). Features encode the downstream flight-departure
+       spread + calendar. Runs in BATCH (no real-time endpoint needed).
+     - Lower-code AutoML alternative: AutoGluon-Tabular (quantile mode) via
+       SageMaker JumpStart. LightGBM (JumpStart) is interchangeable with XGBoost.
+     - Autopilot rejected (no clean quantile output). DeepAR rejected as primary
+       (autoregressive; our problem is feature-driven regression) - alt only.
+
+  2. ARRIVAL SPREAD / OFFSET DISTRIBUTION = MEASURED -> NO ML.
+     - Descriptive statistics on observed data: bin (scheduled_departure -
+       entry_timestamp) per lounge (per segment if needed), normalize -> histogram.
+     - Tech (default): a SQL aggregation query in the Historical data store -
+       data is already in SQL, volume is modest, so binning + normalize is a
+       single GROUP BY where the data lives (cheapest, no extra compute).
+     - Tech (alternative): a SageMaker Processing job (pandas) - preferred when we
+       want the spread computed as a managed STEP CO-LOCATED with the XGBoost
+       training in ONE SageMaker Pipeline (uniform tooling/orchestration, easier
+       lineage/versioning of the artifact, and richer transforms - smoothing,
+       conditional segments - than SQL conveniently allows).
+     - Recomputed every pipeline cycle either way.
+     - "Prediction" of future spread = PERSISTENCE (use latest measured histogram);
+       valid because the offset shape is stable. Re-measuring each cycle captures
+       slow drift; covariate drift -> conditional histograms (still GROUP BY, no ML).
+
+  ORCHESTRATION & RETRAINING:
+     - ONE scheduled pipeline (SageMaker Pipelines / Step Functions / Airflow),
+       run periodically (e.g. nightly/weekly; scheduled, NOT online - AD21).
+       Each run: pull refreshed history -> (branch A) retrain XGBoost quantile
+       arrivals model + batch-infer future curve; (branch B) recompute offset
+       histogram(s).
+
+  OUTPUT PERSISTENCE (artifact store):
+     - Both outputs (arrivals curve + offset histogram), stamped with model_run_id,
+       are written to S3 (the artifact store) - versioned/immutable; the trained
+       model is registered in the SageMaker Model Registry (lineage, NFR8).
+     - S3 is the handoff point: the forecaster does NOT push to the assembler; the
+       assembler READS the latest S3 artifacts each run (forecaster output persists
+       in S3 between weekly runs). Table-shaped artifacts stored as Parquet/JSON
+       (no SQL needed - batch-written, whole-slice-read).
+
+================================================================================
+COMPONENT 4: OCCUPANCY ASSEMBLER
+================================================================================
+
+Purpose: the ONLY component that produces a final occupancy curve. Plain compute,
+no ML. Combines forecaster outputs + master config + live data into the per-lounge
+occupancy curve (occupancy is ALWAYS assembled, never directly forecast).
+
+INPUTS (LOCKED - exactly three sources; NO flight schedule - see AD23):
+  1. LIVE DATA FEED:
+     - real-time lounge arrivals (scans): entry_timestamp, flight's d, lounge id
+       (who is already in),
+     - lounge pre-booking reservations: d, reserved slot, lounge id
+       (committed future arrivals),
+     - near-time flight data (live delays): d_est / delay per flight
+       (to re-anchor leave = d_est - b).
+  2. DEMAND FORECASTER (read from the S3 artifact store, NOT pushed):
+     - arrivals curve per lounge (quantiles per time-bucket),
+     - arrival-spread / offset distribution per lounge.
+     The assembler READS the latest S3 artifacts (Parquet/JSON, by model_run_id)
+     each run; they persist in S3 between weekly forecaster runs. Stateless -
+     no internal copy held.
+  3. MASTER CONFIG:
+     - lounge capacity c (per lounge),
+     - buffer b.
+  NOT taken: the flight schedule. It reaches the assembler indirectly -
+  (a) baked into the forecaster's arrivals curve (far-future), and
+  (b) carried as d / d_est on each live record (near-term). Departures are derived
+  by convolving the arrivals curve with the dwell distribution (dwell = offset - b)
+  - no schedule needed.
+
+OUTPUTS (LOCKED):
+  ONE materialized occupancy curve PER LOUNGE = a sequence of time-bucketed
+  records. This IS the curve-store schema (nothing transforms it before the
+  Scoring API except a lookup, AD11). Whole-lounge only (AD7).
+
+  Curve header (per lounge, per assembler run)
+  lounge_id     : LHR-T5-A
+  capacity      : 100
+  bucket_size   : 15 min
+  generated_at  : 2026-06-20 08:32
+
+
+Per-bucket records (the curve itself)
+────────────┬──────┬──────┬──────┬────────┬────────┬────────┬──────────────┬────────────┬──────────┐
+│ bucket     │ occ  │ occ  │ occ  │ pct    │ pct    │ pct    │ seat_        │ confidence │ source   │
+│ (start)    │ p10  │ p50  │ p90  │ p10    │ p50    │ p90    │ probability  │            │          │
+├────────────┼──────┼──────┼──────┼────────┼────────┼────────┼──────────────┼────────────┼──────────┤
+│ 08:30      │  72  │  78  │  85  │  72%   │  78%   │  85%   │   0.99       │ high       │ live     │
+│ 08:45      │  80  │  86  │  93  │  80%   │  86%   │  93%   │   0.92       │ high       │ live     │
+│ 09:00      │  85  │  92  │ 101  │  85%   │  92%   │ 101%   │   0.73       │ medium     │ blend    │
+│ 09:15      │  83  │  90  │ 100  │  83%   │  90%   │ 100%   │   0.78       │ medium     │ blend    │
+│ 10:00      │  60  │  74  │  90  │  60%   │  74%   │  90%   │   0.85       │ low        │ baseline │
+└────────────┴──────┴──────┴──────┴────────┴────────┴────────┴──────────────┴────────────┴──────────┘
+
+
+  Header (per lounge per assembler run):
+    - lounge_id, capacity, bucket_size, generated_at, model_run_id
+      (model_run_id ties the curve to the producing forecaster run - lineage,
+      NFR8).
+
+  Per-bucket record:
+    - bucket_start.
+    - occupancy_p10 / p50 / p90        (headcount distribution for the bucket).
+    - occupancy_pct_p10 / p50 / p90    (= headcount quantiles / capacity).
+    - seat_probability                 (= P(occupancy < capacity); strict
+      capacity, NOT a comfort threshold - comfort is app-layer).
+    - confidence                       (high / medium / low).
+    - source                           (live / blend / baseline).
+
+  Design stance: emit AS MANY data points as we can (full quantile bands for both
+  headcount and pct); WHICH ones to use is the Scoring API's logic (e.g. p50 for a
+  typical estimate, p90 for a conservative answer, average over a d-window).
+
+  Occupancy is a DISTRIBUTION per bucket (not a point) - that is what makes
+  seat_probability meaningful (AD8, AD22). It collapses to a point at t=now.
+
+  CONFIDENCE - what it represents and how it is used:
+    - It is a DIFFERENT question from seat_probability:
+        seat_probability = "how likely is a seat free?" (property of the world).
+        confidence        = "how much to trust that number?" (property of the
+                            estimate). They are independent.
+    - Driven by: (1) source/horizon (live=high, blend=medium, baseline=low;
+      variance shrinks toward now, AD22), (2) band width (narrow p10-p90 = high),
+      (3) degraded mode (NFR3): if the live feed drops and a near-term bucket
+      falls back to baseline, confidence drops to flag it.
+    - Downstream uses (app layer / Scoring API - the engine only EMITS it):
+      message framing (crisp vs hedged), whether to surface/caveat a prediction,
+      graceful-degradation signal (NFR3), ranking input for flight scoring (UJ1),
+      and ops monitoring (NFR4).
+
+INTERNAL LOGIC (LOCKED):
+
+  CORE IDENTITY (used by both paths):
+    occupancy(t) = SUM over arrival-times tau<=t of [ arrivals(tau) * S(t - tau) ]
+    where S(x) = P(dwell > x) is the survival function of dwell, dwell = offset - b.
+    => occupancy = arrivals curve CONVOLVED with the dwell survival function.
+    This applies departures WITHOUT per-flight attribution. S is derived once from
+    the forecaster's offset distribution shifted by b (master config).
+
+  STAGE 0 - SETUP:
+    - Bucket the horizon at 15-min buckets (DECISION: 15 min).
+    - Derive dwell survival S from (offset distribution - b).
+
+  STAGE 1 - FAR-TERM / BASELINE buckets (no live data):
+    - occupancy = (forecaster arrivals curve) convolved with S.
+    - Compute per quantile: convolve the p10, p50, p90 arrival curves SEPARATELY
+      -> occupancy p10/p50/p90. (DECISION: this quantile approximation is fine for
+      v1; ignores cross-bucket correlation.)
+    - source = baseline, confidence = low.
+
+  STAGE 2 - NEAR-TERM buckets (live data exists) = sum of three parts:
+    1. STILL-PRESENT (from scans): each actual scan is present from entry_timestamp
+       until leave = d_est - b. Deterministic; re-anchors automatically when d_est
+       moves (live delays).
+    2. COMMITTED RESERVATIONS: reservation-holders not yet scanned, present over
+       [arrival, leave], discounted by a no-show rate.
+    3. RESIDUAL FUTURE WALK-INS: future inflow not covered by 1/2, departures via
+       convolution with S.
+    - FUTURE INFLOW combination (DECISION 1): future inflow per bucket =
+      MAX(forecast, reservations). The forecaster curve already includes
+      reservation-holders (trained on all scans), so MAX avoids double-counting
+      while letting reservations act as a high-confidence floor.
+    - occupancy(t) = still_present(t) + future-inflow-still-present(t).
+    - source = live (near) / blend (where forecaster residual dominates),
+      confidence = high / medium.
+
+  STAGE 3 - ASSEMBLE ONE CURVE:
+    - Overwrite the baseline's near-term buckets with Stage-2 values -> ONE
+      materialized curve (AD11). Tag source/confidence per bucket.
+    - LIVE HORIZON (how far Stage 2 runs) = extent of live signal (furthest
+      reservation), CONFIGURABLE. Exact value is an IMPLEMENTATION detail, out of
+      scope here.
+
+  STAGE 4 - DERIVE OUTPUTS:
+    - occupancy_pct = occupancy / capacity (p10/p50/p90). UNCAPPED: pct may exceed
+      100% (DECISION 2) - kept as an overflow / over-capacity signal.
+    - seat_probability = P(occupancy < capacity) from the distribution; the cap is
+      encoded HERE, not by clipping occupancy.
+
+TECHNOLOGY (LOCKED):
+  Stateless numerical compute (convolution + aggregation; no ML, no model server).
+  Light, vectorizable, embarrassingly parallel per lounge (NFR5).
+
+  - COMPUTE RUNTIME: containerized Python (numpy/scipy for convolution, pandas for
+    bucketing).
+      - ECS Fargate (same container)
+  - READS:
+      - forecaster outputs (arrivals curve + offset distribution) from an artifact
+        store (e.g. S3 / a table),
+      - current LIVE STATE (scans / reservations / latest d_est) from the Live Data
+        feed. NOTE: the live-state store is OUT OF SCOPE - treated as part of the
+        Live Data feed; its tech is not decided here.
+      - master config (capacity c, buffer b).
+  - WRITES: the materialized curve -> Curve Store (DynamoDB; see Component 5).
+
+================================================================================
+COMPONENT 5: CURVE STORE
+================================================================================
+
+Purpose: hold the ONE materialized occupancy curve per lounge; the read-optimized
+serving store the Scoring API queries. Resolves AD15.
+
+INPUTS (written by the Occupancy Assembler):
+  - per-lounge, per-bucket records (upserts): occupancy p10/p50/p90,
+    occupancy_pct p10/p50/p90, seat_probability, confidence, source; plus
+    capacity / generated_at / model_run_id context (model_run_id = lineage, NFR8).
+  - Write pattern: near-term buckets upserted every few minutes (micro-batch);
+    full baseline upserted on the forecaster cadence.
+
+OUTPUTS (read by the Scoring API):
+  - range read: given a lounge and a time window, return its buckets in that
+    window (e.g. d-180 to d-40). Interactive latency (NFR2); read = lookup.
+
+INTERNAL LOGIC:
+  - Passive store. Access pattern = "partition by lounge, range by time-bucket".
+  - No computation; values are precomputed by the assembler (NFR2).
+
+TECHNOLOGY (LOCKED - resolves AD15):
+  - DynamoDB. partition key = lounge_id, sort key = bucket_start -> native range
+    queries, single-digit-ms reads, cheap upserts, serverless scaling with no
+    index tuning (NFR5). Matches the (lounge, time-bucket) access pattern exactly.
+  - FUTURE ADDITION: Redis as a read cache in front of DynamoDB. Useful if the
+    Scoring API needs sub-millisecond reads or very high read fan-out (e.g. many
+    concurrent flight-search queries hitting the same hot lounges) - cache the
+    hottest (lounge, near-term window) slices; DynamoDB remains the durable store.
+
+  Sample (DynamoDB items; one lounge, capacity 100):
+  ┌────────────┬──────────────----┬──────-┬───────┬─────┬───────┬───────┬───────┬──────────┬───────────┬─────────┐
+  │ lounge_id  │ bucket_start     │ occ10 │ occ50 │occ90│ pct10 │ pct50 │ pct90 │ seat_prob│ confidence│ source  │
+  │ (PK)       │ (SK)             │       │       │     │       │       │       │          │           │         │
+  ├────────────┼──────────────----┼─────--┼───────┼─────┼───────┼───────┼───────┼──────────┼───────────┼─────────┤
+  │ LHR-T5-A   │ 2026-06-20T08:30 │  72   │  78   │  85 │  72   │  78   │  85   │  0.99    │ high      │ live    │
+  │ LHR-T5-A   │ 2026-06-20T08:45 │  80   │  86   │  93 │  80   │  86   │  93   │  0.92    │ high      │ live    │
+  │ LHR-T5-A   │ 2026-06-20T09:00 │  85   │  92   │ 101 │  85   │  92   │ 101   │  0.73    │ medium    │ blend   │
+  │ LHR-T5-A   │ 2026-06-20T10:00 │  60   │  74   │  90 │  60   │  74   │  90   │  0.85    │ low       │ baseline│
+  └────────────┴──────────────----┴────--─┴───────┴─────┴──--───┴───────┴───────┴──────────┴───────────┴─────────┘
+
+================================================================================
+COMPONENT 6: SCORING API
+================================================================================
+
+Purpose: the engine's read boundary - serves the materialized occupancy curve to
+the Application backend (predict-and-score, not decide; FR12).
+
+APP-SIDE NOTE (out of scope of the engine): the Application backend also reads
+"user preferences" from an Application DB (diagram: Application DB -> Application
+backend, labelled user preferences). This reflects original_requirements service
+(ii) "my preferences and flight time". Preferences live entirely on the app side,
+DOWNSTREAM of the Scoring API. HOW preferences are used (in the app backend, or to
+interpret Scoring API responses) is OUT OF SCOPE of this prediction engine - no
+further detail required (consistent with AD6).
+
+USABLE DERIVED SIGNALS (from the assembler's per-bucket output) - to be exploited
+in the Scoring API's query logic:
+  1. occupancy_pct can EXCEED 100% (raw, pre-cap) -> an OVERFLOW signal: more
+     people want in than fit. Useful to express "lounge will be over capacity",
+     not just "full".
+  2. seat_probability drops below ~1 exactly where pct p90 pushes past capacity
+     -> a crisp "risk of no seat" signal derived from the band crossing capacity.
+
+INPUTS (LOCKED) - request payload:
+  { lounge_ids: [...], slots: [[ts_start, ts_end], ...] }
+  - CROSS-PRODUCT semantics: every lounge in lounge_ids is scored against every
+    slot in slots. Serves UJ1 (one lounge, many time-slots) and UJ6 (many lounges)
+    with one call.
+  - The slot [ts_start, ts_end] timestamps are COMPUTED BY THE APP BACKEND
+    (out of scope; e.g. d-180 to d-40). The user's flight d is therefore already
+    baked into the slots - the API itself does not take d.
+  - Assumption: requested slots ALWAYS fall within the curve-store horizon
+    (out-of-horizon handling skipped).
+
+OUTPUTS (LOCKED) - response, per (lounge, slot):
+  { lounge_id, slot:[ts_start, ts_end], occupancy_pct, seat_probability,
+    confidence }
+  - Echoes lounge_id + slot so the app can map results back.
+  - occupancy_pct is a SINGLE value per slot for now (which quantile / how a slot's
+    buckets reduce to one number = business logic, discussed next; returning the
+    p10/p90 band is an optional later extension).
+
+  SAMPLE REQUEST (JSON):
+    {
+      "lounge_ids": ["LHR-T5-A", "LHR-T3-B"],
+      "slots": [
+        ["2026-06-20T13:00", "2026-06-20T14:20"],
+        ["2026-06-20T15:00", "2026-06-20T16:20"]
+      ]
+    }
+
+  SAMPLE RESPONSE (JSON) - cross-product of lounges x slots:
+    {
+      "results": [
+        {
+          "lounge_id": "LHR-T5-A",
+          "slot": ["2026-06-20T13:00", "2026-06-20T14:20"],
+          "occupancy_pct": 78,
+          "seat_probability": 0.92,
+          "confidence": "high"
+        },
+        {
+          "lounge_id": "LHR-T5-A",
+          "slot": ["2026-06-20T15:00", "2026-06-20T16:20"],
+          "occupancy_pct": 92,
+          "seat_probability": 0.73,
+          "confidence": "medium"
+        },
+        {
+          "lounge_id": "LHR-T3-B",
+          "slot": ["2026-06-20T13:00", "2026-06-20T14:20"],
+          "occupancy_pct": 64,
+          "seat_probability": 0.97,
+          "confidence": "high"
+        },
+        {
+          "lounge_id": "LHR-T3-B",
+          "slot": ["2026-06-20T15:00", "2026-06-20T16:20"],
+          "occupancy_pct": 81,
+          "seat_probability": 0.85,
+          "confidence": "medium"
+        }
+      ]
+    }
+
+INTERNAL LOGIC (LOCKED):
+  For each (lounge_id, slot) in the request cross-product:
+
+  STEP 1 - RANGE READ the Curve Store:
+    DynamoDB query: partition = lounge_id, bucket_start in [ts_start, ts_end).
+    Returns the slot's buckets, each with occ p10/p50/p90, pct p10/p50/p90,
+    seat_probability, confidence, source. (A 80-min slot at 15-min buckets ~ 6
+    buckets.)
+
+  STEP 2 - REDUCE the buckets to the three output fields (REDUCTION STRATEGY):
+    - occupancy_pct   = MEAN of bucket pct_p50 across the slot
+                        ("typical / average % full during the window").
+    - seat_probability = MIN of bucket seat_probability across the slot
+                        (PEAK / worst-bucket: the busiest moment governs whether
+                        you actually get a seat; averaging could hide a short
+                        crunch).
+    - confidence       = MIN (weakest-link) of bucket confidence across the slot
+                        (the slot is only as trustworthy as its least-certain
+                        bucket).
+
+  STEP 3 - ASSEMBLE response item { lounge_id, slot, occupancy_pct,
+    seat_probability, confidence }. Repeat over the lounge x slot cross-product
+    -> results[].
+
+  NOTES:
+    - occupancy_pct is AVERAGE-based; seat_probability is PEAK/MIN-based - each
+      field answers its own question best (typical fullness vs can-I-get-a-seat).
+    - Response is the three locked fields only (overflow flag NOT surfaced; the
+      overflow risk is already encoded in seat_probability via the capacity cap).
+    - Out-of-horizon slots are assumed not to occur (locked assumption).
+
+TECHNOLOGY (LOCKED):
+  - Stateless, read-only, I/O-bound service: FastAPI (async) container.
+  - Runtime: ECS Fargate (serverless containers, no cluster ops), behind an ALB,
+    horizontally autoscaled (CPU / RPS). EKS only if the org is already
+    standardized on Kubernetes.
+  - Reads: DynamoDB Curve Store (+ future Redis cache for hot lounges, Component 5).
+  - Stateless -> trivial horizontal scaling (NFR2 latency, NFR5 scale).
+
+================================================================================
+COMPONENT 7: APPLICATION BACKEND LOGIC  (app layer - OUT OF SCOPE of the engine)
+================================================================================
+
+Purpose: documents HOW the app backend consumes the Scoring API for the user
+journeys. This sits DOWNSTREAM of the engine boundary (predict-and-score, FR12);
+captured for completeness, not an engine deliverable. Assumption: one airport
+(IATA) has MULTIPLE lounges (multiple lounge_ids).
+
+JOURNEY 1 - Flight search, sort flights by lounge seat probability:
+  - App backend fetches the future flight schedule for the search.
+  - For each candidate flight it computes a timeslot = approx (d-3h) to (d-30m)
+    (exact window = impl detail).
+  - It fetches all lounges applicable to the departing airport (its lounge_ids).
+  - Builds ONE Scoring API request: { lounge_ids:[...], slots:[[...],...] }
+    (cross-product: each flight's slot x each applicable lounge).
+  - Scoring API returns occupancy_pct, seat_probability, confidence per
+    (lounge_id, slot).
+  - To rank flights: for each flight's slot, take the BEST lounge =
+    MAX across applicable lounges (occupancy_pct, seat_probability, confidence).
+  - Since each slot maps to a flight, sort the flights by that max lounge
+    seat_probability.
+
+JOURNEY 2 - Specific flight view (clicked/booked), show all lounges:
+  - App backend builds a similar payload but with ONE slot (this flight's window)
+    and MULTIPLE lounge_ids (all applicable lounges).
+  - Scoring API returns occupancy_pct + seat_probability + confidence PER lounge.
+  - UI displays all lounges so the user can choose which to book.
+
+JOURNEY 3 - User-preference filtering (preferences out of scope, just noted):
+  - Preferences (e.g. airport choice within a city - Heathrow in London,
+    day/night flights, direct-only, etc.) are applied as a FILTER to the flight
+    schedule BEFORE hitting the Scoring API (filtered schedule -> Scoring API).
+  - A flag isResultsByUserPreference controls this:
+      * ON  -> UI shows "Preferences applied to flight selection" + "Show all" CTA;
+      * OFF (Show all) -> no preference filter applied to the schedule.
+  - Exact filtering logic = implementation detail, NOT in scope.
+
+NOTE: this component does not change the engine. It only describes app-side
+consumption of the locked Scoring API contract (Component 6) + user preferences
+from the Application DB.
+
+################################################################################
+PART 2: NON-FUNCTIONAL REQUIREMENTS - how the architecture achieves each
+################################################################################
+
+NFR1 - FRESHNESS (LOCKED)
+  Target: near-term curve reflects a new scan/reservation/delay within A FEW
+  MINUTES; far-future curve refreshes on the FORECASTER cadence.
+
+  HOW ACHIEVED - two freshness regimes, two triggers:
+
+  Near-term ("a few minutes"):
+    live data lands -> EventBridge SCHEDULE fires the Occupancy Assembler every
+    few minutes (micro-batch, AD21) -> assembler reads live state + forecaster
+    outputs + config, recomputes Stage 2 (near-term buckets: still-present
+    re-anchored on latest d_est, committed reservations, residual walk-ins) and
+    UPSERTS them to the Curve Store -> next Scoring API query reflects it.
+    => worst-case staleness ~= one micro-batch interval (tunable by schedule rate).
+    No streaming/Kafka: queries anchor to a future d, so minute-level freshness is
+    sufficient and far simpler/cheaper than a speed layer.
+
+  Far-future ("forecaster cadence"):
+    forecaster pipeline runs on schedule (e.g. nightly/weekly) -> on completion an
+    EventBridge EVENT triggers the assembler's Stage 1 baseline recompute ->
+    upserts far-future buckets. Refreshes once per forecaster cycle - appropriate,
+    nothing that far out changes minute-to-minute (no live signal exists).
+
+  WHY IT HOLDS CHEAPLY: micro-batch compute is spent ONLY where live data changes
+  (near-term); the rest is batch-refreshed. Both write into the ONE materialized
+  curve (AD11), so freshness is achieved at WRITE time - reads stay pure lookups
+  (also protects NFR2).
+  BOUND: near-term staleness <= micro-batch interval (minutes); far-future
+  staleness <= forecaster cadence.
+
+NFR2 - LATENCY (LOCKED)
+  Target: queries return at interactive speed; curves precomputed and served;
+  read path = range lookup + light per-slot reduction, no heavy compute per query.
+
+  HOW ACHIEVED - COMPUTE AT WRITE TIME, NOT READ TIME:
+    All expensive work (forecasting, convolution for departures, quantile
+    assembly, occupancy/seat-prob construction) happens ahead of the query in the
+    assembler and is MATERIALIZED into the curve store (AD11). A query never
+    triggers a model / convolution / curve build.
+
+  READ PATH:
+    1. Scoring API receives { lounge_ids, slots }.
+    2. Per (lounge, slot): DynamoDB range query partition=lounge_id,
+       bucket_start in [ts_start, ts_end) -> native access pattern, single-digit-ms.
+    3. Light reduction over ~6 buckets: mean(pct_p50), min(seat_probability),
+       min(confidence) - trivial arithmetic.
+    4. Assemble results[] and return.
+    => per-request work = N small range reads + trivial arithmetic.
+
+  TECH CONTRIBUTIONS:
+    - DynamoDB: (lounge_id, bucket_start) = partition+sort key -> fast, predictable
+      range reads, no scan/index tuning.
+    - Precomputed curve (AD11): the answer already exists on read.
+    - FastAPI async on Fargate: cross-product reads fan out concurrently, not
+      serial.
+    - ALB + autoscaling: latency stays flat under load (ties to NFR5).
+    - Future Redis cache (Component 5): sub-ms for hottest lounges if ever needed.
+
+  ONE LINE: heavy work at write time + materialized curve => query path is fast
+  DynamoDB range reads + trivial mean/min reduction; interactive by construction,
+  flat under load. (Same "materialize at write time" choice that bounds NFR1.)
+
+NFR3 - GRACEFUL DEGRADATION (LOCKED)
+  Target: if the live feed drops, fall back to the baseline (forecaster-only)
+  curve (degraded, not failed) and flag reduced confidence.
+
+  HOW ACHIEVED - FALLBACK IS STRUCTURAL, not a special error path:
+    The curve is ALWAYS a forecaster baseline (Stage 1) overwritten by near-term
+    live patches (Stage 2). Losing the live feed simply means Stage 2 stops
+    patching; the baseline remains underneath. Every bucket still has a value.
+
+  WHEN THE LIVE FEED DROPS:
+    1. The micro-batch assembler finds no fresh live state.
+    2. It does NOT overwrite near-term buckets; they retain/revert to baseline.
+    3. Those buckets are tagged source = baseline, confidence = low.
+    4. The Scoring API keeps serving the same contract; the confidence field drops
+       - the signal the app layer uses to hedge/warn.
+
+  WHY DEGRADED-NOT-FAILED: user still gets occupancy % + seat_probability +
+  confidence - just the statistically-typical estimate instead of live-informed.
+  No 500s, no empty responses.
+
+  WHAT CARRIES IT:
+    - Two-layer curve (AD11/AD19): baseline is an always-present floor; live is an
+      enhancement, not a dependency.
+    - source + confidence fields (Component 4 output): degradation is
+      SELF-DESCRIBING in the data; no separate health signal needed downstream.
+    - Forecaster runs independently (batch, on history) - unaffected by a live
+      outage, so the baseline is always available.
+
+NFR4 - ACCURACY & CONFIDENCE (LOCKED)
+  Target: predictions carry a confidence signal (high/medium/low) + full quantile
+  bands (p10/p50/p90); model quality is monitored over time under retraining.
+
+  HOW ACHIEVED - three pillars:
+
+  1. UNCERTAINTY QUANTIFIED END-TO-END (quantile bands):
+     forecaster emits quantile arrivals (p10/p50/p90) -> assembler propagates them
+     through the convolution -> occupancy p10/p50/p90 per bucket -> seat_probability
+     = P(occ < capacity) derived from the band. Every served number carries its
+     uncertainty; the band IS the accuracy expression (and what makes seat_prob
+     meaningful).
+
+  2. CONFIDENCE = EXPLICIT, SELF-DESCRIBING SIGNAL:
+     per bucket high/medium/low, driven by source/horizon (live=high, blend=medium,
+     baseline=low; variance shrinks toward now, AD22) + band width (narrow = higher).
+     Scoring API reduces weakest-link (min) per slot -> never over-confident.
+     Distinct from seat_probability (trust-in-estimate vs chance-of-seat).
+
+  3. QUALITY KEPT HONEST UNDER RETRAINING:
+     the retraining loop feeds realized arrivals + delays back as fresh training
+     data on a cadence, so the model tracks reality over time. MEASURABILITY: because
+     realized arrivals are logged alongside what was previously predicted, prediction
+     error / quantile calibration (predicted vs realized) is MEASURABLE. The concrete
+     monitoring step is an implementation detail (left out here).
+
+NFR5 - SCALABILITY (LOCKED)
+  Target: many airports x many lounges with continuous live ingestion; scales
+  horizontally per lounge end to end.
+
+  HOW ACHIEVED - THE LOUNGE IS THE UNIT OF PARALLELISM:
+    Every stage is partitioned by lounge and independent across lounges, so adding
+    lounges/airports is horizontal fan-out, not a bigger single machine. No
+    cross-lounge coupling on the hot path.
+
+    - Forecaster: per-lounge training/inference; more lounges = more independent
+      units in the batch pipeline (off the request path entirely).
+    - Occupancy assembler: stateless, Lambda fan-out per lounge / batch of lounges
+      (Fargate scale-up if needed); each lounge's curve is independent.
+    - Curve store: DynamoDB partition key = lounge_id -> load spreads across
+      partitions; scales throughput/storage transparently, no re-sharding.
+    - Scoring API: stateless FastAPI on Fargate behind ALB, autoscaled on CPU/RPS;
+      no per-lounge state to coordinate.
+
+  LIVE INGESTION AT SCALE: assembler processes per lounge each micro-batch (more
+  lounges = more independent units, bounded by schedule). Retraining-loop buffer
+  stays bounded (in-flight flights only, always-departs assumption).
+
+  WHY NOTHING BOTTLENECKS: no global/shared hot-path state (everything keys on
+  lounge_id); read and write paths scale independently (each autoscales on its own
+  signal); heavy ML is off the serving path (batch forecaster), so query scale is
+  independent of model scale.
+
+NFR6 - DATA PRIVACY / PII (LOCKED)
+  Target: engine stores NO passenger identifiers - only flight number, entry
+  timestamp, lounge, travel date; consumes the minimum (entry_time + d); minimal
+  PII by design; handling/retention remain constraints.
+
+  HOW ACHIEVED - PRIVACY BY DATA MINIMIZATION (don't collect identity at all):
+    Across every store/component the data model carries ONLY flight_number,
+    entry_timestamp, lounge_id, travel_date + flight schedule/delay fields. No
+    name, booking id, passport, or membership id ever enters the engine.
+
+    - Live feed -> assembler: a scan = (entry_timestamp, flight's d, lounge); a
+      reservation = (d, slot, lounge). No identity - just "someone entered for
+      this flight".
+    - Retraining loop store / historical store: same fields, no identity.
+    - Forecaster: aggregates counts/offsets - further from individuals.
+    - Curve store / Scoring API: per-lounge AGGREGATE occupancy - fully anonymous;
+      individuals have dissolved into counts.
+
+  WHY THE DESIGN NATURALLY AVOIDS PII:
+    - Dedupe dropped for history (raw scans, AD20) -> never needed a passenger id
+      to match reservation<->scan.
+    - Whole-lounge prediction (AD7) -> no per-person tracking ever required.
+    - Eligibility/identity out of scope (AD6/A9) -> real user identity stays in the
+      app layer.
+
+  RESIDUAL CONSTRAINT: flight_number + entry_timestamp + travel_date is
+  borderline-linkable if joined with external booking data. So handling/retention
+  stay governed constraints (retraining buffer deletes synced rows - Component 1;
+  historical entry-level retention is a policy), but intrinsic exposure is minimal
+  because identity never enters the engine.
+
+NFR7 - TRAINING-DATA INTEGRITY (LOCKED)
+  Target: retraining loop reliably captures ground-truth - REALIZED ARRIVALS +
+  FLIGHT DELAYS (no-shows NOT a training input); completeness guaranteed by
+  buffering until a flight's actual departure before syncing to history.
+
+  HOW ACHIEVED - DON'T WRITE TO HISTORY UNTIL THE FLIGHT IS COMPLETE:
+    The Retraining loop data store (Component 1) is the gate:
+    1. Live data buffered, keyed by flight-instance.
+    2. Synced to history ONLY when actual_departure is populated.
+    3. Crucial property: passengers enter BEFORE departure, so by the time
+       actual_departure is known, ALL that flight's lounge entries have occurred
+       -> the synced arrival record is COMPLETE, never partial.
+    4. Batch job writes the complete record to history, then deletes it from buffer.
+    => history only ever holds fully-formed, departed-flight records.
+
+  WHY THE GROUND-TRUTH SIGNALS ARE RELIABLE:
+    - Realized arrivals: raw entry scans = actual observed entries; counting needs
+      no dedup/identity (AD20) - a scan is one physical entry, so the count IS truth.
+    - Flight delays: actual_departure - scheduled, straight from the feed; clean,
+      no reconciliation.
+
+  DELIBERATELY EXCLUDED:
+    - No-shows: a near-term assembler concept (reservation discounted live), NOT
+      logged for training -> smaller, cleaner integrity surface.
+    - Leaves: never observed (NOTE2), never logged -> no fabricated departure data.
+
+  GUARANTEES: completeness (buffer-until-actual-departure), correctness (observed
+  scans + feed delays, nothing synthesized), no partial-state leakage (only
+  departed flights enter history; in-flight stay in the bounded buffer).
+
+NFR8 - REPRODUCIBILITY / MODEL LINEAGE (LOCKED)
+  Target: scheduled retraining produces versioned model + data artifacts, so a
+  prediction is traceable to a model/data version.
+
+  HOW ACHIEVED - EVERY RETRAIN EMITS VERSIONED, IMMUTABLE ARTIFACTS:
+    Retraining is a scheduled pipeline (not ad-hoc, not online), so each cycle is a
+    discrete recordable event with tagged outputs:
+    - Versioned training data: append-only historical store (Component 2) -> the
+      exact training set of a run is a reproducible snapshot (as-of cut).
+    - Versioned model artifact: each forecaster run produces a registered model
+      (e.g. SageMaker Model Registry version) + the offset-histogram artifact,
+      stamped with the run id.
+    - Versioned outputs: the curve carries generated_at AND model_run_id.
+
+  DECISION: the Curve Store record (Component 4 output header) stores BOTH
+  generated_at AND the model/run_id that produced it -> lineage is DIRECT, not
+  inferred.
+
+  LINEAGE CHAIN:
+    data snapshot (append-only, as-of cut)
+      -> forecaster pipeline run -> versioned model + offset artifact (run id /
+         registry version)
+      -> assembler run -> curve stamped with generated_at + model_run_id
+      -> Scoring API response -> traceable back to model version + data cut.
+
+  WHAT CARRIES IT: scheduled pipeline (discrete logged run ids), append-only
+  history (reproducible data snapshot), model registry (exact model + offset
+  artifact), curve stamped with generated_at + model_run_id (ties a served value
+  to its producing run).
+
+################################################################################
+END PART 2 (NFR1-NFR8 locked). All functional components (1-6) and NFRs complete.
+################################################################################

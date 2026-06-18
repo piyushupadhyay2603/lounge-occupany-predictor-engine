@@ -1,0 +1,122 @@
+### DISCUSSIONS — Priority Pass Lounge Occupancy (working notes)
+
+## CONCRETE DECISIONS (agreed)
+
+D1. The core problem is a *recommendation* problem, not just an occupancy-prediction
+    problem. Occupancy estimation is the means; helping the user choose lounge/flight
+    is the end.
+
+D2. Single forecast engine. "Live occupancy" is just the t=now slice of one
+    continuous occupancy-over-time curve per lounge. Not two separate subsystems.
+
+D3. Two consumer outputs sit on top of the engine:
+    - Occupancy estimation engine -> time-indexed occupancy curve per lounge.
+    - Recommendation layer -> consumes curves + user prefs + flight schedule.
+
+D4. Flight recommendation IS in scope (not just lounge selection). System may
+    suggest flight timings using lounge occupancy as a ranking factor.
+
+## USER JOURNEYS (agreed scope)
+
+UJ1. Flight search: suggest flight timings factoring in lounge occupancy.
+UJ2. Flight clicked (not booked): show lounge occupancy forecast around flight
+     time (X hours before departure; exact X is impl detail, out of scope).
+UJ3. Flight already booked: on app open, show latest lounge occupancy forecast.
+UJ4. Pre-booked lounge seats: system accounts for reservations to forecast for
+     other passengers around the same time.
+UJ5. Live data: people entering lounge + their flight departure time feed the
+     near-term estimate.
+UJ6. At-airport, no reservation: show current predicted occupancy to decide
+     which lounge (or whether to enter a single lounge at all).
+
+## OUTPUT CONTRACT & DATA FLOW (agreed)
+
+G8. Live flight status is ingested. When flight departure time "d" moves (delay), system:
+    (a) adjusts the occupancy prediction curve in real time, AND
+    (b) records the delay as a data point in storage -> feeds continuous
+        (re)training of the forecast engine (e.g. AWS Forecast).
+    => Engine = base historical training data + live ingestion of factors
+       (e.g. flight delays) for continuous training. Implies a feedback loop /
+       data pipeline, not a one-shot trained model.
+
+G9. Prediction output (what the passenger sees):
+    - Occupancy as occupied/total seats, e.g. "70/200 seats approx occupied".
+    - A probability % of getting a seat.
+    Recommendation layer turns this into a decision signal.
+
+## SERVING MODEL & SCOPE BOUNDARY (agreed)
+
+G10. One engine, two serving paths. = ONE model + ONE output contract + ONE
+     definition of the occupancy curve (preserves D2). Two computation/serving
+     MODES, selected by forecast horizon based on which inputs exist:
+     - Path A (batch / far-future): no scans/reservations/live status exist yet
+       -> curve computed periodically from trained model + flight schedule only.
+     - Path B (real-time / near-term): live signals exist -> baseline curve
+       continuously corrected with scans + reservations + live flight status.
+     Reconciled so the consumer always gets one coherent answer (batch layer +
+     speed layer pattern).
+
+G11. Prediction is always anchored to the passenger's flight departure time d.
+     - System ALWAYS needs d. If not already known, it prompts a boarding-pass
+       scan to obtain d.
+     - User NEVER sees a future forecast curve. The curve is an internal artifact.
+       User-facing uses: (1) occupancy + seat-probability at the relevant time,
+       (2) feeding flight suggestions when user hasn't booked (UJ1).
+     - Whether any curve/forecast is shown = UI/app-backend decision, EXPLICITLY
+       OUT OF SCOPE. Deliverable boundary = engine + recommendation API contract,
+       not the screen.
+
+## UJ1 RANKING (agreed)
+
+G12. Engine does NOT rank flights. Given a set of candidate departure times [d],
+     it returns occupancy % / seat-probability % for each d. The app layer
+     combines this with other signals (price, timing, etc.) and decides
+     presentation. Engine = predict-and-score service, not a decide service.
+
+## NON-FUNCTIONAL REQUIREMENTS (agreed)
+
+N1. Freshness: Path B (near-term) reflects new scan/reservation/delay within
+    seconds-to-low-minutes; Path A (far-future) refreshed on batch cadence.
+N2. Latency: occupancy/seat-probability queries return at interactive speed
+    (curves are precomputed/served, not computed per request).
+N3. Graceful degradation: if live feed drops, fall back to batch/model baseline
+    curve (degraded, not failed) and flag reduced confidence.
+N4. Accuracy/confidence: predictions carry a confidence signal; model quality
+    monitored over time under continuous retraining.
+N5. Scalability: many airports x many lounges x continuous live ingestion;
+    engine scales horizontally per-lounge.
+N6. Data privacy/PII: boarding-pass scan is personal data; engine consumes only
+    what it needs (entry_time + d); note PII handling/retention as a constraint.
+N7. Continuous-training data integrity: live ingestion feeding retraining (G8)
+    must reliably capture ground-truth signals (delays, no-shows).
+N8. OUT OF SCOPE: auth, eligibility, UI/presentation, multi-region, cost.
+
+## KEY ARCHITECTURAL OBSERVATIONS
+
+A1. "Who left" is never measured. Even live occupancy is an inference (dwell-time
+    / departure model), not a measured count.
+A2. Two forecast regimes:
+    - Far-future (flight search weeks out): no live signal -> historical/seasonal model.
+    - Near-term / same-day: live signal available -> blend live + model.
+
+## RESOLVED GAPS
+
+G1. RESOLVED. Pre-booking service exists; reservation carries flight departure
+    time d and reserves a slot (e.g. d-3h to d-45m). Exact values are impl detail.
+G2. RESOLVED. Lounge capacity = static master config, fetchable any time.
+G3. RESOLVED. Boarding-pass scan at entry yields (entry_time, flight_departure_d)
+    per entrant. Departure (leaving) is NEVER measured -> must be predicted.
+G4. RESOLVED. Assume historical data exists to train a model (e.g. AWS Forecast).
+    Caveat: "actual leave time" is NEVER in the data; must be predicted from
+    flight departure timings + dwell model.
+G5. RESOLVED / OUT OF SCOPE. Eligibility = deterministic backend logic, not part
+    of this architecture. This architecture is about occupancy prediction +
+    suggestion only.
+G6. RESOLVED. System has dedupe logic so a passenger who pre-booked AND entered
+    is not double-counted. Single reconciled occupancy ledger.
+G7. RESOLVED. Model must handle no-shows and over-stays.
+    - No-show on a pre-booked seat: detectable DETERMINISTICALLY (slot passes,
+      no matching scan).
+    - Over-stay: NOT deterministic; must be predicted. Proxy signals: lounge
+      floor-manager interviews + historical avg flight-delay data (flight delay
+      assumed most probable cause of over-stay).

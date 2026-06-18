@@ -1,0 +1,197 @@
+================================================================================
+REFINED REQUIREMENTS — Priority Pass Lounge Occupancy Prediction Engine
+================================================================================
+
+Base : requirements/original_requirements.txt
+
+--------------------------------------------------------------------------------
+1. OBJECTIVE
+--------------------------------------------------------------------------------
+
+Build a lounge occupancy prediction engine that helps Priority Pass users make
+better decisions about which lounge to use and which flight to book, by
+predicting how full a lounge will be at a given time.
+
+The engine is a PREDICT-AND-SCORE service, not a decide/present service. It
+produces, per lounge, an occupancy estimate over time anchored to a passenger's
+flight departure time, and exposes occupancy % / probability-of-getting-a-seat.
+Ranking, eligibility filtering, and presentation are the responsibility of the
+consuming application layer and are out of scope.
+
+Core principle: occupancy prediction is the means; supporting the user's
+lounge/flight decision is the end.
+
+--------------------------------------------------------------------------------
+2. ASSUMPTIONS
+--------------------------------------------------------------------------------
+
+A1.  Lounge total seat capacity is known, static master-config data, fetchable
+     at any time.
+
+A2.  A real-time feed reports who has ENTERED a lounge, but NOT when they leave.
+     Departure (leave) time is never measured and must be predicted.
+
+A3.  On entry, a boarding pass is scanned, yielding per entrant:
+     (entry_time, flight_departure_time "d").
+
+A4.  A lounge seat pre-booking feature exists. A reservation carries the
+     passenger's flight departure time "d" and reserves a slot relative to it
+     (e.g. d-3h to d-45m). Exact slot values are an implementation detail.
+
+A5.  A flight schedule service provides all flights to/from the airport, and a
+     live flight-status feed provides delays / movement of departure time "d".
+
+A6.  A user-preferences/flight service provides the requesting user's
+     preferences and flight time.
+
+A7.  Historical occupancy data exists to train a forecasting model (e.g. AWS
+     Forecast). Note: actual "leave time" is never present in the data and must
+     be predicted from flight departure timings + a dwell model.
+
+A8.  Dedupe logic exists so a passenger who both pre-booked AND entered is
+     counted once (single reconciled occupancy ledger).
+
+A9.  Out of scope and assumed handled elsewhere: authentication, lounge access
+     eligibility (deterministic backend logic), UI/presentation, multi-region,
+     and cost optimization.
+
+A10. The probability/occupancy output is always anchored to a passenger's flight
+     departure time "d". If the system does not already know "d", it obtains it
+     by prompting a boarding-pass scan.
+
+--------------------------------------------------------------------------------
+3. FUNCTIONAL REQUIREMENTS
+--------------------------------------------------------------------------------
+
+FR1.  Single occupancy curve. The system maintains, per lounge, one continuous
+      occupancy-over-time curve. "Live occupancy" is the t=now slice of that same
+      curve — not a separate subsystem.
+
+FR2.  Departure inference. Because leave time is never measured, the system
+      predicts when occupants leave, based on their flight departure time "d"
+      plus a dwell model.
+
+FR3.  Live ingestion. The system ingests real-time signals and updates the
+      near-term curve accordingly:
+        - lounge entries (entry_time, d) from boarding-pass scans,
+        - lounge seat pre-bookings (d, reserved slot),
+        - live flight status / delays.
+
+FR4.  Reservation handling. Pre-bookings are treated as expected occupants and
+      reconciled with actual scans (dedupe). A reservation whose slot passes with
+      no matching scan is recorded DETERMINISTICALLY as a no-show.
+
+FR5.  Delay handling. When a flight's departure time "d" moves:
+        (a) the system adjusts the occupancy prediction curve in real time, and
+        (b) records the delay as a data point in storage for continuous
+            (re)training of the forecast model.
+
+FR6.  No-shows and over-stays. The model accounts for both. No-shows on
+      pre-booked seats are derived deterministically. Over-stays are predicted
+      (non-deterministic), using proxy signals such as historical average flight
+      delays and lounge floor-manager interviews (optional additional data for fine tune).
+
+FR7.  Two serving paths over one engine (one model, one output contract),
+      selected by forecast horizon:
+        - Path A (batch / far-future): no live signals exist yet; curve computed
+          periodically from the trained model + flight schedule.
+        - Path B (real-time / near-term): live signals exist; baseline curve
+          continuously corrected with scans, reservations, and live flight
+          status.
+      Reconciled so consumers always receive one coherent answer.
+
+FR8.  Continuous training. The forecast engine starts from base historical
+      training data and is continuously retrained from live-ingested factors
+      (e.g. flight delays, no-shows).
+
+FR9.  Prediction output contract. For a given lounge and time anchored to "d",
+      the engine returns:
+        - occupancy as occupied/total seats (e.g. "70/200 seats approx
+          occupied"), and
+        - a probability % of obtaining a seat,
+        - with an associated confidence signal.
+
+FR10. Flight suggestion support (UJ1). Given a set of candidate departure times
+      [d], the engine returns occupancy % / seat-probability % for each "d". The
+      engine does NOT rank flights; the app layer combines this with other
+      signals (price, timing, etc.) and decides presentation.
+
+FR11. Supported decision scenarios (the engine provides the prediction inputs;
+      presentation is out of scope):
+        UJ1. Flight search — score candidate departure times by lounge occupancy.
+        UJ2. Flight clicked (not booked) — occupancy forecast around flight time.
+        UJ3. Flight booked — latest occupancy forecast on demand.
+        UJ4. Pre-booked seats factored into forecasts for other passengers.
+        UJ5. Live entries + flight departure times feed the near-term estimate.
+        UJ6. At-airport, no reservation — current predicted occupancy to choose a
+             lounge, or whether to enter a single lounge at all.
+
+FR12. Scope boundary. The deliverable is the engine + recommendation/scoring API
+      contract. Whether any curve or forecast is shown to the user is a
+      UI/app-backend decision and is out of scope.
+
+--------------------------------------------------------------------------------
+4. NON-FUNCTIONAL REQUIREMENTS
+--------------------------------------------------------------------------------
+
+NFR1. Freshness. The near-term curve reflects a new scan/reservation/delay within
+      A FEW MINUTES (micro-batch assembler; no true streaming - nobody queries
+      t=now to the second). The far-future curve refreshes on the FORECASTER
+      cadence (e.g. nightly/weekly). Exact intervals are an implementation detail.
+
+NFR2. Latency. Occupancy / seat-probability queries return at interactive speed.
+      Curves are PRECOMPUTED and served from the curve store; the read path is a
+      range lookup plus only a LIGHT per-slot reduction (mean / min over a few
+      buckets) - no heavy computation per request.
+
+NFR3. Graceful degradation. If the live feed drops, the system falls back to the
+      baseline (forecaster-only) curve (degraded, not failed) and flags reduced
+      confidence, via the per-bucket source (live/blend/baseline) + confidence.
+
+NFR4. Accuracy & confidence. Predictions carry a confidence signal (high/medium/
+      low, driven by source/horizon + quantile-band width) and full quantile
+      bands (p10/p50/p90); model quality is monitored over time under continuous
+      retraining.
+
+NFR5. Scalability. Supports many airports x many lounges with continuous live
+      ingestion; scales horizontally PER LOUNGE end to end (forecaster per lounge,
+      assembler fan-out per lounge, curve store partitioned by lounge, stateless
+      autoscaled read API).
+
+NFR6. Data privacy / PII. The engine stores NO passenger identifiers (no name /
+      id / passport) - only flight number, entry timestamp, lounge, travel date.
+      It consumes the minimum it needs (entry_time + d). PII exposure is minimal
+      by design; handling/retention remain constraints.
+
+NFR7. Training-data integrity. The retraining loop must reliably capture
+      ground-truth signals - REALIZED ARRIVALS + FLIGHT DELAYS (no-shows are NOT
+      a training input). Completeness is guaranteed by buffering live data until a
+      flight's actual departure populates before syncing to history.
+
+NFR8. Reproducibility / model lineage. Scheduled retraining produces versioned
+      model + data artifacts (via the forecaster pipeline), so a prediction is
+      traceable to a model/data version.
+
+--------------------------------------------------------------------------------
+5. NOTES
+--------------------------------------------------------------------------------
+
+NOTE1. "Live occupancy" and "forecast" are the same artifact at different times;
+       the design deliberately uses one engine to keep them consistent.
+
+NOTE2. The system's hardest, irreducible problem is that no one ever observes a
+       passenger LEAVING. Every occupancy number is therefore a prediction, not
+       a measurement — which is why confidence and continuous retraining are
+       first-class concerns.
+
+NOTE3. Reservations are the highest-confidence forward signal (intent + time
+       window known in advance); live scans are next; far-future relies on the
+       trained model + schedule alone.
+
+NOTE4. The engine is intentionally a predict-and-score service. Decisions about
+       eligibility, ranking, and presentation are deferred to the app layer to
+       keep the engine focused and reusable.
+
+NOTE5. This document is architecture-oriented. Concrete numeric values (dwell
+       windows, X-hours-before-flight, refresh intervals, latency targets) are
+       implementation details intentionally left unspecified.

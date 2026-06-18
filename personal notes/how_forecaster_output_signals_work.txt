@@ -1,0 +1,108 @@
+dont write yet, show me a sample how the two output signals "arrivals curve" and "arrival-spread" actually look like in terms of data output of forecaster
+
+Here's what each signal concretely looks like as forecaster output. (Illustrative numbers, one lounge.)
+
+Signal 1 — Arrivals curve (per lounge, per time-bucket, quantiles)
+This is inflow — how many people enter in each bucket (not occupancy). Time is absolute clock time, bucketed.
+
+lounge_id: LHR-T5-A
+bucket_size: 15 min
+date: 2026-06-20
+curve:
+  ┌────────────┬───────────┬───────────┬───────────┐
+  │ bucket     │ arrivals  │ arrivals  │ arrivals  │
+  │ (start)    │   p10     │   p50     │   p90     │
+  ├────────────┼───────────┼───────────┼───────────┤
+  │ 05:00      │    6      │    9      │   13      │
+  │ 05:15      │    8      │   12      │   17      │
+  │ 05:30      │   11      │   16      │   22      │
+  │ 05:45      │   14      │   20      │   27      │
+  │ 06:00      │   12      │   18      │   25      │
+  │ ...        │   ...     │   ...     │   ...     │
+  └────────────┴───────────┴───────────┴───────────┘
+Read as: "between 05:30 and 05:45, expect ~16 people to enter (p10 11, p90 22)." The whole day is a sequence of these. This is the curve shape driven by the downstream flight-departure spread + calendar.
+
+Signal 2 — Arrival-spread / offset distribution
+This is relative to departure — given a person is leaving on a flight at d, how long before d did they enter the lounge. It's a normalized distribution (sums to 1), independent of absolute clock time.
+
+lounge_id: LHR-T5-A
+offset_distribution (minutes before departure d):
+  ┌──────────────────┬──────────┐
+  │ offset bucket     │ fraction │
+  ├──────────────────┼──────────┤
+  │ 0–30 min          │   0.05   │
+  │ 30–60 min         │   0.15   │
+  │ 60–90 min         │   0.27   │
+  │ 90–120 min        │   0.28   │
+  │ 120–150 min       │   0.16   │
+  │ 150–180 min       │   0.09   │
+  └──────────────────┴──────────┘   (Σ = 1.00)
+Read as: "27% of a flight's lounge-goers arrive 60–90 min before departure." This is the shape the assembler convolves (after dwell = offset − b) to compute departures.
+
+How they differ (and why both are needed)
+Arrivals curve	Offset distribution
+Indexed by	absolute clock time	time-before-departure
+Units	count per bucket (with quantiles)	fractions (sum to 1)
+Answers	when do people enter the lounge	how long before their flight they enter
+Used for	the inflow side of occupancy	deriving departures (dwell = offset − b)
+The arrivals curve says when inflow happens; the offset distribution says how long each stays → together (plus b, capacity) the assembler builds occupancy.
+
+One thing to decide when we lock it: the offset distribution — is it one per lounge (as shown), or could it vary by time-of-day/flight-type? Given AD-O1 (we kept b global), I'd suggest one per lounge to start, possibly refined later. Want it per-lounge, or global across all lounges?
+
+what is p10, p50 , p90
+
+They're percentiles (quantiles) of the forecast — the way the model expresses uncertainty instead of committing to a single number.
+
+Definition
+For a given bucket, the forecaster doesn't say "exactly 16 people." It gives a range with probabilities:
+
+p50 (median) — the middle estimate. 50% chance the real number is below it, 50% above. The "expected" value.
+p10 — the low end. Only a 10% chance actual arrivals fall below this.
+p90 — the high end. 90% chance actual arrivals fall below this (so only 10% chance of exceeding it).
+So for the bucket 05:30 → p10=11, p50=16, p90=22:
+
+"Most likely ~16 people arrive. It would be unusually quiet if fewer than 11 (10% chance), and unusually busy if more than 22 (10% chance)."
+
+The gap between p10 and p90 is the confidence band — wide gap = uncertain, narrow gap = confident.
+
+Why we use them (not a single number)
+This is the whole reason occupancy can become a seat-probability (AD4, AD8). If the forecaster only said "16," the assembler could only ever say "the lounge will have exactly N people." By carrying p10/p50/p90 through to occupancy, the assembler can compute things like "P(occupancy < capacity) = 85%" — i.e. the probability you'll get a seat — which is exactly the engine's headline output (FR9).
+
+  arrivals distribution for one bucket:
+  count →   8   11    16    22   26
+            |   |     |     |    |
+  prob   →  ░  p10   p50   p90   ░
+            low  ◄── likely range ──►  high
+Why 10/50/90 specifically
+Just a common, compact choice — enough to describe the shape (a middle + how wide the spread is) without storing the full distribution. We could carry more (p25, p75) or fewer; three is the usual default. It's an impl detail (AD8 says "a few quantiles, e.g. p10/p50/p90").
+
+So in short: p50 = best estimate, p10 = optimistic-low, p90 = pessimistic-high, and the spread between them is what lets us produce a seat probability rather than a flat number.
+
+in arrival spread tell me what does 0.05 represent, how doe it translate to X% of a flight's lounge-goers arrive 60–90 min before departure
+
+0.05 is a fraction = 5%. The offset distribution splits a flight's lounge-goers into "what share of them showed up in each time-window before departure." Each row is that share; they sum to 1.0 (100%).
+
+What 0.05 means
+0–30 min → 0.05 reads: 5% of a flight's lounge-goers arrive in the last 0–30 minutes before departure. And 60–90 min → 0.27 means 27% of them arrive 60–90 minutes before departure.
+
+So 0.27 is the "27%" — fraction × 100 = percent.
+
+Worked example
+Suppose a flight departs at d = 15:00 and the forecaster expects 40 lounge-goers for it. Apply the distribution:
+
+offset bucket    fraction   × 40 people   → arrive during
+0–30 min   →      0.05         2 people      14:30–15:00
+30–60 min  →      0.15         6 people      14:00–14:30
+60–90 min  →      0.27        ~11 people     13:30–14:00
+90–120 min →      0.28        ~11 people     13:00–13:30
+120–150 min→      0.16         6 people      12:30–13:00
+150–180 min→      0.09         4 people      12:00–12:30
+                  ─────       ──────────
+                  1.00         40 people     (all accounted for)
+So "60–90 min → 0.27" means: of the 40 people, about 11 (27%) walk into the lounge between 13:30 and 14:00 (which is d−90 to d−60).
+
+Key points
+It's a shape, not counts — the same distribution applies whether a flight has 10 or 200 lounge-goers; you multiply it by that flight's demand to get actual headcounts.
+Sums to 1.0 — every lounge-goer arrives at some offset, so the fractions cover 100% of them.
+This is what makes it composable: demand (how many) × offset distribution (when, relative to their flight) = each flight's arrival timing — and summed across all flights = the arrivals curve.
+So 0.05 → 5% → "5 out of every 100 of that flight's lounge-goers arrive in that window."

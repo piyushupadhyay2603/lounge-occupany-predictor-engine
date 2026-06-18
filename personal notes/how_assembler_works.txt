@@ -1,0 +1,8 @@
+The Occupancy Assembler Internal logic is now in the doc:
+
+Core identity — occupancy = arrivals ⊛ dwell-survival S, dwell = offset − b (departures without per-flight attribution).
+Stage 0 — 15-min buckets; derive S.
+Stage 1 (far-term/baseline) — convolve forecaster arrivals per quantile; source=baseline, confidence=low.
+Stage 2 (near-term) — still-present (scans, re-anchored on d_est), committed reservations (no-show discounted), residual walk-ins; future inflow = max(forecast, reservations) to avoid double-count; source=live/blend.
+Stage 3 — overwrite near-term buckets into one materialized curve; live horizon = configurable (impl detail, out of scope).
+Stage 4 — pct uncapped (overflow signal allowed); seat_probability = P(occupancy < capacity) encodes the cap.

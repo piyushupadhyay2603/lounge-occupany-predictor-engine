@@ -1,0 +1,5 @@
+Scoring API Internal logic:
+
+Step 1 — range-read the Curve Store (DynamoDB: partition lounge_id, bucket_start ∈ [ts_start, ts_end)).
+Step 2 — reduction: occupancy_pct = mean of pct_p50 (typical fullness); seat_probability = min across buckets (peak/worst moment governs getting a seat); confidence = min (weakest-link).
+Step 3 — assemble per (lounge, slot) into results[] over the cross-product.

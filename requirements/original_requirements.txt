@@ -1,0 +1,5 @@
+A tool to predict airport lounge occupancy, helping our users choose which is the best lounge (or flight) to book
+Assume we have:
+i. A service that provides real time indication of who has entered a lounge but not if they have left
+ii. A service that provides my preferences and flight time
+iii. A service that provides all the flights to and from the airport

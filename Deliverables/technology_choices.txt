@@ -1,0 +1,137 @@
+This document summarizes the working, scale, tradeoff and tech choices for each functional components of Prediction Engine.
+Application layer (app backend, app UI) are considered out of scope from discussion on technology choices.
+COMPONENT 7: APPLICATION BACKEND LOGIC inside detailed_architecture_notes.txt summarizes how app layer uses this prediction engine.
+
+__________________________
+How everything works :
+__________________________
+
+1. Forecaster does future demand forecasts (lounge arrivals) based on historical data (e.g. once a week)
+2. Assembler runs every 15 mins, fetches live flight info, lounge arrivals, and creates a near time prediction (e.g. next 1 hrs given it has access to who is already inside(lounge entries), pre booked lounge seats and base line prediction from forecaster), superimposes this on the long term prediction, converts demand forecast into a  predicted occupancy % and writes per lounge prediction curve (occupancy vs timestamp[15 min interval]) to Curve store (dynamo db table).
+3. Now Scoring API whenever called to give occupancy % for a flight (assume a flight at 3 PM, application backend will ask scoring API, for this lounge, give me occupancy % from 12 PM to 2.30 PM). The scoring API takes all 15 min buclets in the curve store applicable in this time window and reduces it to one occupancy % and provides as response.
+4. App backend handles how to present it and bake in user preferences.
+
+The prediction engine ouputs occupancy prediction per lounge in 15 min buckets. (per lounge - is the assuption I have made)
+
+Simplified view of curve store data:
+
+Lounge_id | Time bucket        | Predicted occpation % | Seat probability
+
+LHR-T5-A  | 2026-06-20T08:30   |     78                | 0.99
+LHR-T5-A  | 2026-06-20T08:45   |     86                | 0.92
+
+DEL-T3-C  | 2026-06-20T08:30   |     78                | 0.99
+DEL-T3-C  | 2026-06-20T08:45   |     86                | 0.92
+
+This data contains the baseline forecaster occupancy prediction (long term prediction) and superimposes near time (current) data for someone checking for lounge occupancy lets say in 15 min (already at the checkin counter).
+____________________________________________
+========
+SCALE :
+========
+The complete architectire is horizontly scalable as more and more lounges get added.
+
+Historical data should use sliding window to handle years and years of data. (way forward)
+
+===========
+TRADE-OFF : 
+===========
+
+IF WEEKLY PREDICTION ONLY : Save costs on AWS Sagemekaer training pipelines. --> Lose accuracy on what is happening right now on floor. This works for someone searching a flight 6 weeks from now, but fails to provide accurate information for someone already at the airport and wants a choice of which lounge to go based on live occupancy.
+
+IF PREDICTION EVERY 15 mins : Works well to predict near time (next 1 hr) occupancy but leads to huge costs as part of training pipelines.
+
+SOLUTION : Use mixed approach --> Take long term prediction (calculated only weekly) and take live on floor lounge arrivals data and assemble --> Assembler (win-win)
+
+This works because : 
+
+Long term occupancy needs to be more predictive and less Deterministic.
+Live occupancy is more deterministic and less predictive.
+
+____________________________________________
+
+FUNCTIONAL COMPONENTS :
+
+================================================================================
+HISTORICAL DATA STORE:
+================================================================================
+
+Stores flight data and lounge arrival data in a SQL table structure
+
+Technology choice : postgresQL/My SQL on AWS RDS. (Managed, backups, disaster recovery, multi-AZ)
+
+Table: Flight data
+================================================================================
+flight_number | scheduled_departure | actual_departure  | delay_min | iata | terminal | lounge_name      | lounge_id  | created_at        | updated_at
+--------------+---------------------+-------------------+-----------+------+----------+------------------+------------+-------------------+-------------------
+BA117         | 2026-06-20 09:00    | 2026-06-20 09:25  | 25        | LHR  | T5       | Galleries First  | LHR-T5-A   | 2026-06-20 06:02  | 2026-06-20 09:25
+BA283         | 2026-06-20 09:15    | 2026-06-20 09:15  | 0         | LHR  | T5       | Galleries First  | LHR-T5-A   | 2026-06-20 06:40  | 2026-06-20 09:15
+AA109         | 2026-06-20 10:00    | 2026-06-20 10:40  | 40        | LHR  | T3       | Greenwich Lounge | LHR-T3-B   | 2026-06-20 07:10  | 2026-06-20 10:40
+
+
+Table: Lounge data
+================================================================================
+lounge_id  | entry_timestamp    | flight_number | travel_date  | created_at        | updated_at
+-----------+--------------------+---------------+--------------+-------------------+-------------------
+LHR-T5-A   | 2026-06-20 07:05   | BA117         | 2026-06-20   | 2026-06-20 07:05  | 2026-06-20 07:05
+LHR-T5-A   | 2026-06-20 07:32   | BA117         | 2026-06-20   | 2026-06-20 07:32  | 2026-06-20 07:32
+LHR-T5-A   | 2026-06-20 07:48   | BA283         | 2026-06-20   | 2026-06-20 07:48  | 2026-06-20 07:48
+LHR-T5-A   | 2026-06-20 08:10   | BA117         | 2026-06-20   | 2026-06-20 08:10  | 2026-06-20 08:10
+LHR-T5-A   | 2026-06-20 08:25   | BA283         | 2026-06-20   | 2026-06-20 08:25  | 2026-06-20 08:25
+LHR-T3-B   | 2026-06-20 08:30   | AA109         | 2026-06-20   | 2026-06-20 08:30  | 2026-06-20 08:30
+
+
+================================================================================
+    DEMAND FORECASTER
+================================================================================
+
+AWS Sagemaker (ML Model hosting and training), Alternative AWS Forecast
+
+Python scripts hosted on containerized AWS ECS/EKS for arrival spread calculation.
+
+EventBridge Scheduler (cron, weekly)
+      │  StartPipelineExecution
+      ▼
+AWS SageMaker Pipeline  (one run, two parallel branches)
+   ├── branch A: ML Model training(XGBoost) → arrivals curve
+   └── branch B: SageMaker Processing job (containerized Python)
+                 → offset histogram
+      ▼
+both write artifacts to S3 (same model_run_id)
+
+Technology choice reasons : containerized python - Horizontally scalable as lounges increase. Start, Stop on demand (Forecaster may run only weekly)
+S3 supports Multi A-Z backups.
+AWS sagemaker - Managed ML infra. Retries. Maitaining model versioning and lineage. Sagemaker Pipelines can provide orchestration.
+
+
+
+================================================================================
+    OCCUPANCY ASSEMBLER
+================================================================================
+
+Short interval runs e.g. 15 mins. Consumes live data, master config and Artifact store every 15 mins.
+
+Tech choice : Containerized python scripts on AWS ECS/EKS. On demand scale.
+
+Redis for maintaining state for per lounge aseembler runs and prvent duplicate triggers.
+
+
+================================================================================
+    RETRAINING LOOP
+================================================================================
+
+Eventbridge on every few intervals triggers a lambda which fetches all departed flights and new lounge arrivals from Live data APIs. Save this data in (Managed AWS RDS postgresQL) and publish a message on SQS. SQS triggers lambda worker which takes the row data in message and inserts to historical data store.
+
+As a row is synced, it can be removed from the staging SQL db of retraining loop.
+
+
+================================================================================
+    OCCUPANCY CURVE STORE
+================================================================================
+
+choice : dynamo db for occupancy curve store. Serverless, Fast lookup, no joins needed for our query, Scalable.
+
+================================================================================
+    SCORING API
+================================================================================
+
+Python fast API backend, containerized on AWS EKS/ECS. This component can be directly influenced by user traffic and the scale of application backend. Containerized APIs gives us the freedom to horizontly auto scale on load.
